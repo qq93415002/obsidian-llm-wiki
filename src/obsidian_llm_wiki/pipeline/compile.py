@@ -26,6 +26,7 @@ import frontmatter as fm_lib
 from ..config import Config
 from ..models import ArticlePlan, CompilePlan, SingleArticle, WikiArticleRecord
 from ..ollama_client import OllamaClient
+from ..sanitize import sanitize_tags
 from ..state import StateDB
 from ..structured_output import StructuredOutputError, request_structured
 from ..vault import (
@@ -156,7 +157,10 @@ def _inject_body_sections(body: str, source_paths: list[str], config: Config) ->
                 src_title = Path(sp).stem.replace("-", " ").title()
         else:
             src_title = Path(sp).stem.replace("-", " ").title()
-        source_lines.append(f"- [[{src_title}]]")
+        safe_src = sanitize_filename(src_title)
+        display = src_title if safe_src != src_title else src_title
+        link = f"[[{safe_src}|{display}]]" if safe_src != src_title else f"[[{src_title}]]"
+        source_lines.append(f"- {link}")
 
     # ## See Also: wikilinks already in body (sorted, deduplicated)
     linked = sorted(set(extract_wikilinks(body)))
@@ -229,6 +233,11 @@ def _write_concept_prompt(
         prompt += f"\nVAULT CONVENTIONS:\n{vault_schema}\n"
     prompt += (
         f"\nIMPORTANT: Keep the content field under 800 words. Be concise.\n"
+        f"Tags must be lowercase, hyphen-separated, no spaces or special characters. "
+        f"Good: machine-learning, quantum-computing. Bad: Machine Learning, C++.\n"
+        f"Do NOT use inline hashtags (#tag) in the content body — use [[wikilinks]] only.\n"
+        f"If source material references images or diagrams, mention their filenames "
+        f"so they can be embedded later (e.g. ![[diagram.png]]).\n"
         f"Use [[wikilinks]] inline in prose to link to related concepts.\n\n"
         f"Existing wiki articles to link to: {titles_str}\n\n"
         f"SOURCE MATERIAL:\n{sources}"
@@ -378,7 +387,10 @@ def _write_prompt_legacy(article: ArticlePlan, sources: str, existing_titles: li
         f'Write the wiki article: "{article.title}"\n'
         f"Action: {article.action}\n"
         f"Reasoning: {article.reasoning}\n"
-        f"IMPORTANT: Keep the content field under 800 words. Be concise.\n\n"
+        f"IMPORTANT: Keep the content field under 800 words. Be concise.\n"
+        f"Tags must be lowercase, hyphen-separated, no spaces or special characters. "
+        f"Good: machine-learning, quantum-computing. Bad: Machine Learning, C++.\n"
+        f"Do NOT use inline hashtags (#tag) in the content body — use [[wikilinks]] only.\n\n"
         f"Existing wiki articles to link to: {titles_str}\n\n"
         f"SOURCE MATERIAL:\n{sources}"
     )
@@ -546,6 +558,9 @@ def approve_drafts(
         meta, body = parse_note(draft_path)
         meta["status"] = "published"
         meta["updated"] = datetime.now().strftime("%Y-%m-%d")
+        # Sanitize tags defensively — covers old drafts written before sanitization was added
+        if isinstance(meta.get("tags"), list):
+            meta["tags"] = sanitize_tags([str(t) for t in meta["tags"] if t is not None])
         write_note(target, meta, body)  # write to destination first
         draft_path.unlink()  # only remove draft after target is safely written
 

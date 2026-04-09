@@ -15,6 +15,8 @@ from typing import Any
 
 import frontmatter
 
+from .sanitize import sanitize_tags
+
 # ── Frontmatter ───────────────────────────────────────────────────────────────
 
 
@@ -25,10 +27,9 @@ def parse_note(path: Path) -> tuple[dict[str, Any], str]:
 
 
 def write_note(path: Path, metadata: dict[str, Any], body: str) -> None:
-    """Write markdown file with YAML frontmatter."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """Write markdown file with YAML frontmatter atomically (crash-safe)."""
     post = frontmatter.Post(body, **metadata)
-    path.write_text(frontmatter.dumps(post), encoding="utf-8")
+    atomic_write(path, frontmatter.dumps(post))
 
 
 def update_frontmatter(path: Path, updates: dict[str, Any]) -> None:
@@ -41,20 +42,58 @@ def update_frontmatter(path: Path, updates: dict[str, Any]) -> None:
 # ── Wikilinks ─────────────────────────────────────────────────────────────────
 
 _WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]")
-_CODE_BLOCK_RE = re.compile(r"```[\s\S]*?```|`[^`]+`")
+# Images/media embedded via ![[file.ext]] — filter these from link extraction
+_MEDIA_EXTENSIONS = frozenset(
+    {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".svg",
+        ".webp",
+        ".bmp",
+        ".tiff",
+        ".avif",
+        ".mp4",
+        ".webm",
+        ".ogv",
+        ".mov",
+        ".mkv",
+        ".avi",
+        ".mp3",
+        ".wav",
+        ".ogg",
+        ".flac",
+        ".m4a",
+        ".pdf",
+        ".csv",
+        ".xlsx",
+        ".docx",
+    }
+)
 
 
 def extract_wikilinks(content: str) -> list[str]:
-    """Return all [[target]] titles found in content."""
-    return _WIKILINK_RE.findall(content)
+    """Return all [[target]] titles, excluding targets with media file extensions.
+
+    Note: filters by extension regardless of embed syntax (![[...]]) vs normal link ([[...]]).
+    This prevents media filenames from appearing as broken wikilinks in lint checks.
+    """
+    raw = _WIKILINK_RE.findall(content)
+    return [t for t in raw if not any(t.lower().endswith(ext) for ext in _MEDIA_EXTENSIONS)]
 
 
 def _mask_code_blocks(content: str) -> tuple[str, list[tuple[int, int, str]]]:
-    """Replace code block content with placeholders, return original spans."""
+    """Replace code blocks and image/embed syntax with placeholders.
+
+    Protects: ```...```, `...`, ![[embed]], ![alt](url) from wikilink insertion.
+    """
+    # Combine: code blocks + embed/image patterns
+    combined_re = re.compile(r"```[\s\S]*?```|`[^`]+`|!\[\[[^\]]+\]\]|!\[[^\]]*\]\([^)]*\)")
     spans: list[tuple[int, int, str]] = []
     masked = content
     offset = 0
-    for m in _CODE_BLOCK_RE.finditer(content):
+    for m in combined_re.finditer(content):
         start, end = m.start() + offset, m.end() + offset
         placeholder = "X" * (end - start)
         masked = masked[:start] + placeholder + masked[end:]
@@ -123,6 +162,16 @@ def list_draft_articles(drafts_dir: Path) -> list[tuple[str, Path]]:
             sources = []
         articles.append((title, md, sources))
     return articles
+
+
+# ── Wikilink target safety ────────────────────────────────────────────────────
+
+_WIKILINK_UNSAFE = re.compile(r"[\[\]|#^]")
+
+
+def sanitize_wikilink_target(name: str) -> str:
+    """Remove characters that break [[wikilink]] syntax: [ ] | # ^"""
+    return _WIKILINK_UNSAFE.sub("", name).strip()
 
 
 # ── Filename safety ───────────────────────────────────────────────────────────
@@ -203,7 +252,7 @@ def build_wiki_frontmatter(
     now = datetime.now().strftime("%Y-%m-%d")
     meta: dict[str, Any] = {
         "title": title,
-        "tags": tags,
+        "tags": sanitize_tags(tags),
         "sources": sources,
         "confidence": round(confidence, 2),
         "status": "draft" if is_draft else "published",
