@@ -93,13 +93,14 @@ class OllamaClient:
         system: str = "",
         format: str | None = None,
         num_ctx: int = 8192,
+        num_predict: int = -1,
     ) -> str:
         payload: dict = {
             "model": model,
             "prompt": prompt,
             "system": system,
             "stream": False,
-            "options": {"num_ctx": num_ctx},
+            "options": {"num_ctx": num_ctx, "num_predict": num_predict},
         }
         if format:
             payload["format"] = format
@@ -108,6 +109,8 @@ class OllamaClient:
             resp.raise_for_status()
         except httpx.ConnectError:
             raise OllamaError(_STARTUP_HINT)
+        except httpx.TimeoutException as e:
+            raise OllamaError(f"Ollama request timed out: {e}") from e
         except httpx.HTTPStatusError as e:
             raise OllamaError(
                 f"Ollama HTTP error: {e.response.status_code} {e.response.text}"
