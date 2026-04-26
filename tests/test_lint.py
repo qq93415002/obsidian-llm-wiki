@@ -146,6 +146,21 @@ def test_valid_wikilink_not_broken(vault, config, db):
     assert not broken
 
 
+def test_parenthesized_title_base_resolves(vault, config, db):
+    _write_page(config, "Alpha", "See [[Workflow]].")
+    _write_page(
+        config,
+        "Workflow (Process Pattern)",
+        "Linked from Alpha.",
+        meta_override={"title": "Workflow (Process Pattern)"},
+    )
+
+    result = run_lint(config, db)
+
+    broken = [i for i in result.issues if i.issue_type == "broken_link"]
+    assert not broken
+
+
 def test_url_wikilinks_not_broken(vault, config, db):
     """[[https://example.com]] and domain/path links must not trigger broken_link."""
     body = "See [[https://example.com/page]] and [[scrummasters.com.ua/book]]."
@@ -164,6 +179,29 @@ def test_vault_path_fragments_not_broken(vault, config, db):
     assert not broken
 
 
+def test_source_path_wikilink_valid_when_source_page_exists(vault, config, db):
+    (config.sources_dir).mkdir(parents=True, exist_ok=True)
+    _write_page(config, "Alpha", "See [[sources/Source Note|S1]].")
+    write_note(
+        config.sources_dir / "Source Note.md",
+        {"title": "Source Note", "tags": ["source"], "status": "published"},
+        "Source summary.",
+    )
+
+    result = run_lint(config, db)
+    broken = [i for i in result.issues if i.issue_type == "broken_link"]
+    assert not broken
+
+
+def test_source_path_wikilink_missing_is_broken(vault, config, db):
+    _write_page(config, "Alpha", "See [[sources/Missing Source|S1]].")
+
+    result = run_lint(config, db)
+    broken = [i for i in result.issues if i.issue_type == "broken_link"]
+    assert broken
+    assert "sources/Missing Source" in broken[0].description
+
+
 def test_duplicate_broken_links_deduplicated(vault, config, db):
     """Same broken target appearing multiple times in one page → only one issue."""
     body = "See [[Ghost]] here. Also [[Ghost]] there. And [[Ghost]] again."
@@ -172,6 +210,246 @@ def test_duplicate_broken_links_deduplicated(vault, config, db):
     broken = [i for i in result.issues if i.issue_type == "broken_link"]
     assert len(broken) == 1
     assert "Ghost" in broken[0].description
+
+
+def test_malformed_bracket_link_detected(vault, config, db):
+    _write_page(config, "Alpha", "This mentions [astronomy] without a URL.")
+
+    result = run_lint(config, db)
+
+    malformed = [i for i in result.issues if i.issue_type == "malformed_link"]
+    assert malformed
+    assert "[astronomy]" in malformed[0].description
+
+
+def test_citation_markers_not_malformed_links(vault, config, db):
+    _write_page(config, "Alpha", "Claim [S1]. Joint [S1,S2].")
+
+    result = run_lint(config, db)
+
+    malformed = [i for i in result.issues if i.issue_type == "malformed_link"]
+    assert not malformed
+
+
+def test_obsidian_callout_marker_not_malformed_link(vault, config, db):
+    _write_page(config, "Alpha", "> [!info] This is a callout.")
+
+    result = run_lint(config, db)
+
+    malformed = [i for i in result.issues if i.issue_type == "malformed_link"]
+    assert not malformed
+
+
+def test_malformed_bracket_link_detected_in_draft(vault, config, db):
+    write_note(
+        config.drafts_dir / "Draft.md",
+        {"title": "Draft", "tags": [], "status": "draft"},
+        "Draft mentions [astronomy] without a URL.",
+    )
+
+    result = run_lint(config, db)
+
+    malformed = [i for i in result.issues if i.issue_type == "malformed_link"]
+    assert malformed
+    assert malformed[0].path == "wiki/.drafts/Draft.md"
+
+
+def test_dangling_bracket_detected_in_draft(vault, config, db):
+    write_note(
+        config.drafts_dir / "Draft.md",
+        {"title": "Draft", "tags": [], "status": "draft"},
+        "The article ends with a broken link fragment [",
+    )
+
+    result = run_lint(config, db)
+
+    malformed = [i for i in result.issues if i.issue_type == "malformed_link"]
+    assert malformed
+    assert "Dangling '['" in malformed[0].description
+
+
+def test_broken_wikilink_detected_in_draft(vault, config, db):
+    write_note(
+        config.drafts_dir / "Draft.md",
+        {"title": "Draft", "tags": [], "status": "draft"},
+        "Draft links to [[Invented Page]].",
+    )
+
+    result = run_lint(config, db)
+
+    broken = [i for i in result.issues if i.issue_type == "broken_link"]
+    assert broken
+    assert broken[0].path == "wiki/.drafts/Draft.md"
+
+
+def test_malformed_embed_detected_in_draft(vault, config, db):
+    write_note(
+        config.drafts_dir / "Draft.md",
+        {"title": "Draft", "tags": [], "status": "draft"},
+        "Draft has bad media !./_resources/file.pdf.",
+    )
+
+    result = run_lint(config, db)
+
+    malformed = [i for i in result.issues if i.issue_type == "malformed_embed"]
+    assert malformed
+    assert "file.pdf" in malformed[0].description
+
+
+def test_malformed_embed_fix_repairs_draft(vault, config, db):
+    draft = config.drafts_dir / "Draft.md"
+    write_note(
+        draft,
+        {"title": "Draft", "tags": [], "status": "draft"},
+        "Draft has bad media !./_resources/file.pdf.",
+    )
+
+    result = run_lint(config, db, fix=True)
+
+    malformed = [i for i in result.issues if i.issue_type == "malformed_embed"]
+    assert malformed
+    assert "![[./_resources/file.pdf]]" in draft.read_text()
+
+
+def test_lint_fix_repairs_plain_source_citations(vault, config, db):
+    page = _write_page(
+        config,
+        "Alpha",
+        "Claim [S1].\n\n## Sources\n- [S1] [[sources/Alpha Source|Alpha Source]]",
+    )
+
+    run_lint(config, db, fix=True)
+
+    assert "Claim [S1](#Sources)." in page.read_text()
+    assert "- [S1] [[sources/Alpha Source|Alpha Source]]" in page.read_text()
+
+
+def test_lint_fix_repairs_linked_source_legend_labels(vault, config, db):
+    page = _write_page(
+        config,
+        "Alpha",
+        "Claim [S1](#Sources).\n\n"
+        "## Sources\n- [S1](#Sources) [[sources/Alpha Source|Alpha Source]]",
+    )
+
+    run_lint(config, db, fix=True)
+
+    assert "Claim [S1](#Sources)." in page.read_text()
+    assert "- [S1] [[sources/Alpha Source|Alpha Source]]" in page.read_text()
+
+
+def test_markdown_anchor_links_not_inline_tags(vault, config, db):
+    _write_page(config, "Alpha", "Claim [S1](#Sources).")
+
+    result = run_lint(config, db)
+
+    inline = [i for i in result.issues if i.issue_type == "inline_tag"]
+    assert not inline
+
+
+def test_lint_fix_updates_article_hash(vault, config, db):
+    body = "Claim [S1].\n\n## Sources\n- [S1] [[sources/Alpha Source|Alpha Source]]"
+    page = _write_page(config, "Alpha", body)
+    from obsidian_llm_wiki.pipeline.lint import _body_hash
+
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Alpha.md",
+            title="Alpha",
+            sources=[],
+            content_hash=_body_hash(body),
+            is_draft=False,
+        )
+    )
+
+    run_lint(config, db, fix=True)
+    result = run_lint(config, db)
+
+    assert "Claim [S1](#Sources)." in page.read_text()
+    assert not [i for i in result.issues if i.issue_type == "stale"]
+
+
+def test_graph_quality_flags_welcome(vault, config, db):
+    (config.vault / "Welcome.md").write_text("Welcome. [[create a link]]")
+
+    result = run_lint(config, db)
+
+    graph = [i for i in result.issues if i.issue_type == "graph_noise"]
+    assert graph
+    assert graph[0].path == "Welcome.md"
+
+
+def test_graph_quality_flags_media_embeds_in_drafts(vault, config, db):
+    write_note(
+        config.drafts_dir / "Draft.md",
+        {"title": "Draft", "tags": [], "status": "draft"},
+        "Draft embeds ![[./_resources/file.pdf]].",
+    )
+
+    result = run_lint(config, db)
+
+    graph = [i for i in result.issues if i.issue_type == "graph_noise"]
+    assert graph
+    assert "media embeds" in graph[0].description
+
+
+def test_graph_quality_flags_duplicate_raw_source_titles(vault, config, db):
+    raw = config.raw_dir / "Api testing example.md"
+    raw.write_text("Raw body.")
+    write_note(
+        config.sources_dir / "Api Testing Example.md",
+        {"title": "Api Testing Example", "tags": ["source"], "status": "published"},
+        "Source body.",
+    )
+
+    result = run_lint(config, db)
+
+    graph = [i for i in result.issues if i.issue_type == "graph_noise"]
+    assert any("duplicate raw note titles" in i.description for i in graph)
+
+
+def test_graph_quality_flags_low_concept_connectivity(vault, config, db):
+    write_note(
+        config.drafts_dir / "Alpha.md",
+        {"title": "Alpha", "tags": [], "status": "draft"},
+        "No links.",
+    )
+    write_note(
+        config.drafts_dir / "Beta.md",
+        {"title": "Beta", "tags": [], "status": "draft"},
+        "No links.",
+    )
+
+    result = run_lint(config, db)
+
+    connectivity = [i for i in result.issues if i.issue_type == "graph_connectivity"]
+    assert len(connectivity) == 1
+    assert "and 1 more" in connectivity[0].description
+
+
+def test_graph_quality_checks_can_be_disabled(vault, config, db):
+    config.pipeline.graph_quality_checks = False
+    (config.vault / "Welcome.md").write_text("Welcome. [[create a link]]")
+
+    result = run_lint(config, db)
+
+    assert not [i for i in result.issues if i.issue_type == "graph_noise"]
+
+
+def test_graph_quality_issues_do_not_reduce_health_score(vault, config, db):
+    (config.vault / "Welcome.md").write_text("Welcome. [[create a link]]")
+    raw = config.raw_dir / "Api testing example.md"
+    raw.write_text("Raw body.")
+    write_note(
+        config.sources_dir / "Api Testing Example.md",
+        {"title": "Api Testing Example", "tags": ["source"], "status": "published"},
+        "Source body.",
+    )
+
+    result = run_lint(config, db)
+
+    assert [i for i in result.issues if i.issue_type == "graph_noise"]
+    assert result.health_score == 100.0
 
 
 # ── Low confidence ────────────────────────────────────────────────────────────

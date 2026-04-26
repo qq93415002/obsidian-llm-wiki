@@ -76,6 +76,10 @@ def test_extract_wikilinks_keeps_note_transclusion():
     assert extract_wikilinks("![[other-note]]") == ["other-note"]
 
 
+def test_extract_wikilinks_ignores_inline_code():
+    assert extract_wikilinks("Use `[[Not A Link]]` and [[Real Link]].") == ["Real Link"]
+
+
 def test_extract_wikilinks_excludes_jpg():
     assert extract_wikilinks("![[image.jpg]]") == []
 
@@ -129,6 +133,24 @@ def test_ensure_wikilinks_skip_code_blocks():
     result = ensure_wikilinks(content, ["Python"])
     # Should only link the second "Python", not the one in backticks
     assert "`Python`" in result or "`[[Python]]`" not in result
+
+
+def test_ensure_wikilinks_restores_inline_code_after_length_change():
+    content = "Machine learning then `code`"
+    result = ensure_wikilinks(content, ["Machine learning"])
+    assert result == "[[Machine learning]] then `code`"
+
+
+def test_ensure_wikilinks_restores_fenced_code_after_length_change():
+    content = "Python before\n```\nPython in code\n```"
+    result = ensure_wikilinks(content, ["Python"])
+    assert result == "[[Python]] before\n```\nPython in code\n```"
+
+
+def test_ensure_wikilinks_restores_embed_after_length_change():
+    content = "Python before ![[Python.png]]"
+    result = ensure_wikilinks(content, ["Python"])
+    assert result == "[[Python]] before ![[Python.png]]"
 
 
 def test_ensure_wikilinks_empty_targets():

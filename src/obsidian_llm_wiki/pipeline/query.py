@@ -20,7 +20,7 @@ from ..models import PageSelection, QueryAnswer
 from ..protocols import LLMClientProtocol
 from ..state import StateDB
 from ..structured_output import request_structured
-from ..vault import parse_note, sanitize_filename, write_note
+from ..vault import list_wiki_articles, parse_note, sanitize_filename, write_note
 
 MAX_PAGES = 5
 MAX_CHARS_PER_PAGE = 8_000
@@ -38,6 +38,14 @@ def _load_index(config: Config) -> str:
 
 def _find_page(config: Config, title: str, db: StateDB | None = None) -> Path | None:
     """Resolve a title to a file path. Checks wiki/ root then sources/."""
+    if title.lower().startswith("sources/"):
+        source_title = title.split("/", 1)[1]
+        candidate = config.wiki_dir / f"{title}.md"
+        if candidate.exists():
+            return candidate
+        candidate = config.sources_dir / f"{source_title}.md"
+        if candidate.exists():
+            return candidate
     # Exact filename match (wiki root)
     candidate = config.wiki_dir / f"{title}.md"
     if candidate.exists():
@@ -125,11 +133,13 @@ def run_query(
         context = "(No matching wiki pages found.)"
 
     # Step 3: heavy model answers
+    known_titles = ", ".join(title for title, _ in list_wiki_articles(config.wiki_dir)[:80])
     answer_prompt = (
         "You are answering a question using a personal knowledge wiki.\n\n"
         f"Relevant wiki content:\n{context}\n\n"
         f"Question: {question}\n\n"
-        "Answer using the wiki content. Use [[wikilinks]] when referencing wiki concepts. "
+        "Answer using the wiki content. Use [[wikilinks]] only for existing wiki pages from "
+        f"this list: {known_titles}. Do not create links for terms missing from that list. "
         "Answer in the same language as the user's question. "
         'Return JSON: {"answer": "your full markdown answer here"}'
     )

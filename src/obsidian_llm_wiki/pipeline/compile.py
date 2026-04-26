@@ -19,6 +19,7 @@ import logging
 import re
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -32,10 +33,13 @@ from ..sanitize import sanitize_tags
 from ..state import StateDB
 from ..structured_output import StructuredOutputError, request_structured
 from ..vault import (
+    _mask_code_blocks,
+    _restore_code_blocks,
     atomic_write,
     build_wiki_frontmatter,
     ensure_wikilinks,
     extract_wikilinks,
+    list_draft_articles,
     list_wiki_articles,
     normalize_wikilinks,
     parse_note,
@@ -65,6 +69,21 @@ _WRITE_SYSTEM = (
     "Be accurate, cite sources via [[wikilinks]] in body text, use ## section headings, "
     "write in evergreen style. Put [[wikilinks]] inline in prose — do not save them for later."
 )
+
+_WRITE_SYSTEM_WITH_CITATIONS = (
+    "You are a wiki editor. Write a single wiki article from the provided source material. "
+    "Be accurate, cite factual claims with provided [S1] style source ids, use ## section "
+    "headings, write in evergreen style. Use [[wikilinks]] inline for related concepts."
+)
+
+
+@dataclass(frozen=True)
+class SourceRef:
+    id: str
+    raw_path: str
+    title: str
+    safe_title: str
+    wiki_target: str
 
 
 def _load_vault_schema(config: Config) -> str:
@@ -139,10 +158,64 @@ def _truncate_to_budget(text: str, max_chars: int) -> str:
     return text
 
 
+def _resolve_source_path(source_path: str, vault: Path) -> tuple[Path, str] | None:
+    """Resolve a model/DB source path to an on-disk path and vault-relative path."""
+    candidates = [
+        vault / source_path,
+        vault / "raw" / source_path,
+        vault / "raw" / Path(source_path).name,
+    ]
+    path = next((c for c in candidates if c.exists()), None)
+    if path is None:
+        return None
+    try:
+        rel = str(path.relative_to(vault))
+    except ValueError:
+        rel = source_path
+    return path, rel
+
+
+def _source_title(path: Path, fallback: str) -> str:
+    try:
+        meta, _ = parse_note(path)
+        title = meta.get("title")
+        if isinstance(title, str) and title.strip():
+            return title.strip()
+    except Exception:
+        pass
+    return Path(fallback).stem.replace("-", " ").title()
+
+
+def _build_source_refs(source_paths: list[str], vault: Path) -> list[SourceRef]:
+    refs: list[SourceRef] = []
+    seen: set[str] = set()
+    for sp in source_paths:
+        resolved = _resolve_source_path(sp, vault)
+        if resolved is None:
+            continue
+        path, rel = resolved
+        if rel in seen:
+            continue
+        seen.add(rel)
+        title = _source_title(path, rel)
+        safe_title = sanitize_filename(title)
+        refs.append(
+            SourceRef(
+                id=f"S{len(refs) + 1}",
+                raw_path=rel,
+                title=title,
+                safe_title=safe_title,
+                wiki_target=f"sources/{safe_title}",
+            )
+        )
+    return refs
+
+
 def _gather_sources(
     source_paths: list[str],
     vault: Path,
     max_chars: int = 20000,
+    source_refs: list[SourceRef] | None = None,
 ) -> tuple[str, list[str]]:
     """
     Read source files, return (combined_text, resolved_paths).
@@ -150,17 +223,21 @@ def _gather_sources(
     """
     parts = []
     resolved = []
+    ref_by_raw = {r.raw_path: r for r in source_refs or []}
     for sp in source_paths:
-        # Try path as-is, then prepend raw/ (model often returns bare filenames)
-        candidates = [vault / sp, vault / "raw" / sp, vault / "raw" / Path(sp).name]
-        p = next((c for c in candidates if c.exists()), None)
-        if p is None:
+        resolved_path = _resolve_source_path(sp, vault)
+        if resolved_path is None:
             log.warning("Source not found: %s", sp)
             continue
+        p, rel = resolved_path
         try:
-            meta, body = parse_note(p)
-            parts.append(f"## Source: {p.name}\n{body}")
-            resolved.append(sp)
+            _, body = parse_note(p)
+            ref = ref_by_raw.get(rel)
+            if ref is not None:
+                parts.append(f"## Source [{ref.id}]: {ref.title} ({ref.raw_path})\n{body}")
+            else:
+                parts.append(f"## Source: {p.name}\n{body}")
+            resolved.append(rel)
         except Exception as e:
             log.warning("Could not read %s: %s", sp, e)
 
@@ -182,7 +259,191 @@ def _compute_confidence(source_paths: list[str], db: StateDB) -> float:
     return min(1.0, len(source_paths) * 0.25 + _QUALITY_BONUS.get(best, 0.0))
 
 
-def _inject_body_sections(body: str, source_paths: list[str], config: Config) -> str:
+def _mask_citation_rewrite_regions(content: str) -> tuple[str, list[tuple[str, str]]]:
+    """Protect markdown regions where [S1] markers must not be rewritten."""
+    combined_re = re.compile(
+        r"```[\s\S]*?```|`[^`]+`|!\[\[.*?\]\]|!\[[^\]]*\]\([^)]*\)|\[\[.*?\]\]"
+    )
+    replacements: list[tuple[str, str]] = []
+
+    def replace(match: re.Match[str]) -> str:
+        token = f"__OBSIDIAN_LLM_WIKI_MASK_{len(replacements)}__"
+        replacements.append((token, match.group(0)))
+        return token
+
+    masked = combined_re.sub(replace, content)
+    return masked, replacements
+
+
+def _restore_masked_regions(content: str, replacements: list[tuple[str, str]]) -> str:
+    for token, original in replacements:
+        content = content.replace(token, original)
+    return content
+
+
+def _repair_bare_bracket_links(content: str) -> str:
+    """Convert LLM-produced [Concept] slips into Obsidian [[Concept]] links."""
+    masked, replacements = _mask_citation_rewrite_regions(content)
+    bare_link_re = re.compile(r"(?<![!\[])\[(?!\[)([^\]\n]+)\](?![\[(])")
+
+    def replace(match: re.Match[str]) -> str:
+        target = match.group(1).strip()
+        if not target:
+            return match.group(0)
+        if re.fullmatch(r"S\d+(?:\s*,\s*S\d+)*", target):
+            return match.group(0)
+        return f"[[{target}]]"
+
+    return _restore_masked_regions(bare_link_re.sub(replace, masked), replacements)
+
+
+def _strip_unknown_wikilinks(content: str, known_titles: list[str]) -> str:
+    """Unwrap wikilinks that do not target an existing wiki/source page."""
+    masked, replacements = _mask_code_blocks(content)
+    known = {title.lower() for title in known_titles}
+    wikilink_re = re.compile(r"\[\[([^\]|#]+)(#[^\]|]*)?(?:\|([^\]]*))?\]\]")
+
+    def replace(match: re.Match[str]) -> str:
+        target = match.group(1).strip()
+        fragment = match.group(2) or ""
+        display = match.group(3)
+        if target.lower().startswith("sources/") or target.lower() in known:
+            return match.group(0)
+        return display or f"{target}{fragment}"
+
+    return _restore_code_blocks(wikilink_re.sub(replace, masked), replacements)
+
+
+def _strip_self_wikilinks(content: str, article_title: str) -> str:
+    """Unwrap links that point to the article itself."""
+    title_key = article_title.lower()
+    wikilink_re = re.compile(r"\[\[([^\]|#]+)(#[^\]|]*)?(?:\|([^\]]*))?\]\]")
+
+    def replace(match: re.Match[str]) -> str:
+        target = match.group(1).strip()
+        if target.lower() != title_key:
+            return match.group(0)
+        display = match.group(3)
+        return display or target
+
+    return wikilink_re.sub(replace, content)
+
+
+def _repair_literal_newlines(content: str) -> str:
+    """Repair LLM output that escaped Markdown newlines into literal \n text."""
+    if "\\n" not in content:
+        return content
+    if content.count("\\n") < 2:
+        return content
+    return content.replace("\\n", "\n")
+
+
+_MEDIA_EXT_RE = r"(?:pdf|png|jpe?g|gif|svg|webp)"
+_MALFORMED_MEDIA_EMBED_RE = re.compile(rf"(?<!\S)!([^\s\[]+\.{_MEDIA_EXT_RE})", re.I)
+_MALFORMED_MARKDOWN_MEDIA_RE = re.compile(
+    rf"\\?!\\?\[([^\[\]\n]*?\.{_MEDIA_EXT_RE})(?:\\?\])?(?!\()", re.I
+)
+_OBSIDIAN_MEDIA_EMBED_RE = re.compile(rf"!\[\[([^\]]+\.{_MEDIA_EXT_RE})\]\]", re.I)
+_DANGLING_OPEN_BRACKET_RE = re.compile(r"(?m)(?<!\[)[ \t]+\[[ \t]*$")
+_WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(#[^\]|]*)?(?:\|([^\]]*))?\]\]")
+_WIKILINK_EDGE_QUOTES = "\"'“”‘’«»‹›„「」『』《》"
+
+
+def _repair_malformed_embeds(content: str) -> str:
+    """Repair LLM/media post-processing slips like !./file.pdf into ![[./file.pdf]]."""
+    masked, replacements = _mask_code_blocks(content)
+
+    def replace(match: re.Match[str]) -> str:
+        return f"![[{match.group(1).strip()}]]"
+
+    repaired = _MALFORMED_MARKDOWN_MEDIA_RE.sub(replace, masked)
+    repaired = _MALFORMED_MEDIA_EMBED_RE.sub(replace, repaired)
+    repaired = re.sub(r"\]\]!\[\[", "]]\n![[", repaired)
+    return _restore_code_blocks(repaired, replacements)
+
+
+def _remove_dangling_open_brackets(content: str) -> str:
+    """Remove truncated markdown-link starts that otherwise survive into drafts."""
+    return _DANGLING_OPEN_BRACKET_RE.sub("", content)
+
+
+def _clean_wikilink_target(target: str) -> str:
+    cleaned = target.strip()
+    cleaned = re.sub(r"\s*[,;]\s*S\d+(?:\s*,\s*S\d+)*\s*$", "", cleaned)
+    return cleaned.strip().strip(_WIKILINK_EDGE_QUOTES).strip()
+
+
+def _repair_malformed_wikilinks(content: str, known_titles: list[str]) -> str:
+    """Trim quote/citation debris from wikilink targets before broken-link checks."""
+    masked, replacements = _mask_code_blocks(content)
+    known = {title.casefold() for title in known_titles}
+
+    def replace(match: re.Match[str]) -> str:
+        target = match.group(1).strip()
+        fragment = match.group(2) or ""
+        display = match.group(3)
+        cleaned = _clean_wikilink_target(target)
+        if not cleaned or cleaned == target:
+            return match.group(0)
+        if cleaned.casefold() in known or cleaned.casefold().startswith("sources/"):
+            if display:
+                clean_display = display.strip().strip(_WIKILINK_EDGE_QUOTES).strip()
+                return f"[[{cleaned}{fragment}|{clean_display}]]"
+            return f"[[{cleaned}{fragment}]]"
+        return (display or cleaned).strip().strip(_WIKILINK_EDGE_QUOTES).strip()
+
+    return _restore_code_blocks(_WIKILINK_RE.sub(replace, masked), replacements)
+
+
+def _apply_draft_media_mode(content: str, mode: str) -> str:
+    """Control media embeds in synthesized drafts to reduce graph noise."""
+    if mode == "embed":
+        return content
+
+    def replace(match: re.Match[str]) -> str:
+        target = match.group(1).strip()
+        if mode == "omit":
+            return ""
+        return f"Media reference: {target}"
+
+    return _OBSIDIAN_MEDIA_EMBED_RE.sub(replace, content)
+
+
+def _rewrite_citation_markers(
+    body: str, source_refs: list[SourceRef], *, link_inline: bool = True
+) -> str:
+    """Normalize [S1] markers. Optionally rewrite them to source wikilinks."""
+    if not source_refs:
+        return body
+    by_id = {ref.id: ref for ref in source_refs}
+    masked, replacements = _mask_citation_rewrite_regions(body)
+    marker_re = re.compile(r"\[(S\d+(?:\s*,\s*S\d+)*)\]")
+
+    def replace(match: re.Match[str]) -> str:
+        ids = [part.strip() for part in match.group(1).split(",")]
+        valid_ids = [id_ for id_ in ids if id_ in by_id]
+        if not valid_ids:
+            return ""
+        if not link_inline:
+            text = ",".join(valid_ids)
+            return f"[{text}](#Sources)"
+        links = [f"[[{by_id[id_].wiki_target}|{id_}]]" for id_ in valid_ids]
+        return "(" + ", ".join(links) + ")"
+
+    try:
+        return _restore_masked_regions(marker_re.sub(replace, masked), replacements)
+    except Exception as exc:  # noqa: BLE001 - citations must never fail compilation
+        log.warning("Citation rewrite failed: %s", exc)
+        return body
+
+
+def _inject_body_sections(
+    body: str,
+    source_paths: list[str],
+    config: Config,
+    source_refs: list[SourceRef] | None = None,
+    article_title: str | None = None,
+) -> str:
     """
     Append ## Sources and ## See Also sections to article body.
 
@@ -193,32 +454,45 @@ def _inject_body_sections(body: str, source_paths: list[str], config: Config) ->
     body = re.sub(r"\n## Sources\b.*", "", body, flags=re.DOTALL).rstrip()
     body = re.sub(r"\n## See Also\b.*", "", body, flags=re.DOTALL).rstrip()
 
+    refs = (
+        source_refs if source_refs is not None else _build_source_refs(source_paths, config.vault)
+    )
+
     # ## Sources: link to wiki/sources/{title}.md pages
     source_lines = []
-    for sp in source_paths:
-        # Resolve source file to get its title
-        candidates = [
-            config.vault / sp,
-            config.vault / "raw" / sp,
-            config.vault / "raw" / Path(sp).name,
-        ]
-        raw_path = next((c for c in candidates if c.exists()), None)
-        if raw_path:
-            try:
-                raw_meta, _ = parse_note(raw_path)
-                src_title = raw_meta.get("title") or raw_path.stem.replace("-", " ").title()
-            except Exception:
-                src_title = Path(sp).stem.replace("-", " ").title()
-        else:
+    if config.pipeline.inline_source_citations:
+        for ref in refs:
+            source_lines.append(f"- [{ref.id}] [[{ref.wiki_target}|{ref.title}]]")
+    else:
+        for ref in refs:
+            if ref.safe_title != ref.title:
+                link = f"[[{ref.safe_title}|{ref.title}]]"
+            else:
+                link = f"[[{ref.title}]]"
+            source_lines.append(f"- {link}")
+
+        # Keep historical fallback for unresolved paths when the feature is disabled.
+        resolved_raw = {ref.raw_path for ref in refs}
+        for sp in source_paths:
+            if sp in resolved_raw:
+                continue
             src_title = Path(sp).stem.replace("-", " ").title()
-        safe_src = sanitize_filename(src_title)
-        display = src_title if safe_src != src_title else src_title
-        link = f"[[{safe_src}|{display}]]" if safe_src != src_title else f"[[{src_title}]]"
-        source_lines.append(f"- {link}")
+            safe_src = sanitize_filename(src_title)
+            display = src_title if safe_src != src_title else src_title
+            link = f"[[{safe_src}|{display}]]" if safe_src != src_title else f"[[{src_title}]]"
+            source_lines.append(f"- {link}")
 
     # ## See Also: wikilinks already in body (sorted, deduplicated)
     linked = sorted(set(extract_wikilinks(body)))
-    see_also_lines = [f"- [[{t}]]" for t in linked if t]
+    see_also_lines = []
+    for target in linked:
+        if not target:
+            continue
+        if target.lower().startswith("sources/"):
+            continue
+        if article_title and target.lower() == article_title.lower():
+            continue
+        see_also_lines.append(f"- [[{target}]]")
 
     sections = "\n\n## Sources"
     if source_lines:
@@ -239,20 +513,45 @@ def _write_draft(
     existing_titles: list[str] | None = None,
     concept_aliases: list[str] | None = None,
     alias_map: dict[str, str] | None = None,
+    canonical_title: str | None = None,
 ) -> Path:
     """Write SingleArticle to wiki/.drafts/ and record in state DB."""
     config.drafts_dir.mkdir(parents=True, exist_ok=True)
 
-    safe_name = sanitize_filename(content_result.title)
+    article_title = canonical_title or content_result.title
+    safe_name = sanitize_filename(article_title)
     draft_path = config.drafts_dir / f"{safe_name}.md"
 
     # Inject wikilinks for known article titles mentioned in body
-    body = ensure_wikilinks(content_result.content, existing_titles or [])
+    body = _repair_literal_newlines(content_result.content)
+    body = _repair_malformed_embeds(body)
+    body = _repair_bare_bracket_links(body)
+    body = ensure_wikilinks(body, existing_titles or [])
     # Normalize alias-based links to canonical targets
     if alias_map:
         known = {t.lower() for t in (existing_titles or [])}
         body = normalize_wikilinks(body, alias_map, known)
-    body = _inject_body_sections(body, source_paths, config)
+    source_refs = _build_source_refs(source_paths, config.vault)
+    if config.pipeline.inline_source_citations:
+        body = _rewrite_citation_markers(
+            body,
+            source_refs,
+            link_inline=config.pipeline.source_citation_style == "inline-wikilink",
+        )
+    source_targets = [ref.wiki_target for ref in source_refs]
+    body = _repair_malformed_wikilinks(body, (existing_titles or []) + source_targets)
+    body = _strip_unknown_wikilinks(body, (existing_titles or []) + source_targets)
+    body = _strip_self_wikilinks(body, article_title)
+    body = _repair_malformed_embeds(body)
+    body = _remove_dangling_open_brackets(body)
+    body = _apply_draft_media_mode(body, config.pipeline.draft_media)
+    body = _inject_body_sections(
+        body,
+        source_paths,
+        config,
+        source_refs=source_refs,
+        article_title=article_title,
+    )
 
     # Prepend quality annotations (invisible HTML comments, stripped on approve)
     annotations = _build_olw_annotations(confidence, source_paths, db)
@@ -266,7 +565,7 @@ def _write_draft(
             body = annotation_block + body
 
     meta = build_wiki_frontmatter(
-        title=content_result.title,
+        title=article_title,
         tags=content_result.tags,
         sources=source_paths,
         confidence=confidence,
@@ -281,7 +580,7 @@ def _write_draft(
     db.upsert_article(
         WikiArticleRecord(
             path=str(draft_path.relative_to(config.vault)),
-            title=content_result.title,
+            title=article_title,
             sources=source_paths,
             content_hash=_content_hash(body),
             is_draft=True,
@@ -302,6 +601,7 @@ def _write_concept_prompt(
     vault_schema: str = "",
     rejection_history: list[str] | None = None,
     language: str | None = None,
+    inline_source_citations: bool = False,
 ) -> str:
     titles_str = ", ".join(existing_titles[:50]) if existing_titles else "none yet"
     lang_instruction = (
@@ -322,8 +622,15 @@ def _write_concept_prompt(
         f"so they can be embedded later (e.g. ![[diagram.png]]).\n"
         f"Use [[wikilinks]] inline in prose to link to related concepts.\n\n"
         f"Existing wiki articles to link to: {titles_str}\n\n"
-        f"SOURCE MATERIAL:\n{sources}"
     )
+    if inline_source_citations:
+        prompt += (
+            "Inline source citations: cite factual sentences/paragraphs with [S1] or "
+            "[S1,S2]. Use only ids listed in SOURCE MATERIAL. Do not invent ids. "
+            "Do not emit raw [[sources/...]] links. Example: Quantum states can be "
+            "entangled [S1,S2].\n\n"
+        )
+    prompt += f"SOURCE MATERIAL:\n{sources}"
     if existing_content:
         prompt += f"\n\nEXISTING ARTICLE (you are updating this):\n{existing_content}"
     if rejection_history:
@@ -367,27 +674,19 @@ def compile_concepts(
 
     log.info("Compiling %d concept(s)", len(concept_names))
     existing_titles = [t for t, _ in list_wiki_articles(config.wiki_dir)]
+    draft_titles = [t for t, _, _ in list_draft_articles(config.drafts_dir)]
+    link_titles = existing_titles + [t for t in draft_titles if t not in existing_titles]
+    for concept_name in concept_names:
+        if concept_name not in link_titles:
+            link_titles.append(concept_name)
     vault_schema = _load_vault_schema(config)
     total = len(concept_names)
     # Build alias resolution map once per compile run
     alias_map = db.list_alias_map()
 
-    if dry_run:
-        for name in concept_names:
-            srcs = db.get_sources_for_concept(name)
-            is_stub = db.has_stub(name)
-            stub_tag = " [stub]" if is_stub else ""
-            print(
-                f"  [concept{stub_tag}] {name} — {len(srcs)} source(s): "
-                f"{', '.join(Path(s).name for s in srcs)}"
-            )
-        return [], [], {}
-
     draft_paths: list[Path] = []
     failed: list[str] = []
     concept_timings: dict[str, float] = {}
-    compiled_sources: set[str] = set()
-
     for idx, name in enumerate(concept_names, 1):
         if on_progress:
             on_progress(idx, total, name)
@@ -402,7 +701,17 @@ def compile_concepts(
         # Manual edit protection
         safe_name = sanitize_filename(name)
         wiki_path = config.wiki_dir / f"{safe_name}.md"
+        draft_path = config.drafts_dir / f"{safe_name}.md"
         existing_meta: dict | None = None
+
+        if draft_path.exists() and not force:
+            if dry_run:
+                print(f"  [skip] {name} — draft already pending review")
+                continue
+            log.info(
+                "Skipping '%s' — draft already pending review (use --force to overwrite)", name
+            )
+            continue
 
         if wiki_path.exists():
             try:
@@ -410,10 +719,21 @@ def compile_concepts(
                 if not force:
                     art_rec = db.get_article(str(wiki_path.relative_to(config.vault)))
                     if art_rec and art_rec.content_hash != _content_hash(existing_body):
+                        if dry_run:
+                            print(f"  [skip] {name} — published article manually edited")
+                            continue
                         log.info("Skipping '%s' — manually edited (use --force to override)", name)
                         continue
             except Exception:
                 pass
+
+        if dry_run:
+            stub_tag = " [stub]" if is_stub else ""
+            print(
+                f"  [concept{stub_tag}] {name} — {len(source_paths)} source(s): "
+                f"{', '.join(Path(s).name for s in source_paths)}"
+            )
+            continue
 
         # For stubs: compile with empty sources using a lightweight stub prompt
         if is_stub and not source_paths:
@@ -444,7 +764,8 @@ def compile_concepts(
                 db=db,
                 confidence=0.0,
                 existing_meta=existing_meta,
-                existing_titles=existing_titles,
+                existing_titles=link_titles,
+                canonical_title=name,
                 concept_aliases=db.get_aliases(name),
                 alias_map=alias_map,
             )
@@ -456,8 +777,16 @@ def compile_concepts(
             continue
 
         # Gather source material within context budget
+        source_refs = (
+            _build_source_refs(source_paths, config.vault)
+            if config.pipeline.inline_source_citations
+            else None
+        )
         sources_text, resolved_paths = _gather_sources(
-            source_paths, config.vault, max_chars=config.effective_provider.heavy_ctx // 2
+            source_paths,
+            config.vault,
+            max_chars=config.effective_provider.heavy_ctx // 2,
+            source_refs=source_refs,
         )
         if not resolved_paths:
             log.warning("No readable sources for concept '%s', skipping", name)
@@ -485,11 +814,12 @@ def compile_concepts(
         write_prompt = _write_concept_prompt(
             name,
             sources_text,
-            existing_titles,
+            link_titles,
             existing_content,
             vault_schema,
             rejection_history,
             language=lang,
+            inline_source_citations=config.pipeline.inline_source_citations,
         )
 
         try:
@@ -498,7 +828,11 @@ def compile_concepts(
                 prompt=write_prompt,
                 model_class=SingleArticle,
                 model=config.models.heavy,
-                system=_WRITE_SYSTEM,
+                system=(
+                    _WRITE_SYSTEM_WITH_CITATIONS
+                    if config.pipeline.inline_source_citations
+                    else _WRITE_SYSTEM
+                ),
                 num_ctx=config.effective_provider.heavy_ctx,
                 num_predict=min(_MAX_ARTICLE_PREDICT, config.effective_provider.heavy_ctx),
                 stage="compile_article",
@@ -515,19 +849,17 @@ def compile_concepts(
             db=db,
             confidence=confidence,
             existing_meta=existing_meta,
-            existing_titles=existing_titles,
+            existing_titles=link_titles,
+            canonical_title=name,
             concept_aliases=db.get_aliases(name),
             alias_map=alias_map,
         )
         draft_paths.append(draft_path)
-        compiled_sources.update(resolved_paths)
+        for sp in resolved_paths:
+            db.mark_raw_status(sp, "compiled")
         elapsed = time.monotonic() - _t_concept
         concept_timings[name] = elapsed
         log.info("Draft written: %s (%.1fs)", draft_path.name, elapsed)
-
-    # Mark all sources that fed any compiled concept as 'compiled'
-    for sp in compiled_sources:
-        db.mark_raw_status(sp, "compiled")
 
     return draft_paths, failed, concept_timings
 
@@ -727,12 +1059,18 @@ def approve_drafts(
 
     published = []
     for draft_path in paths:
+        draft_path = draft_path.resolve()
+        vault_root = config.vault.resolve()
         if not draft_path.exists():
             log.warning("Draft not found: %s", draft_path)
             continue
 
         # Target: wiki/ with same relative structure
-        rel_to_drafts = draft_path.relative_to(config.drafts_dir)
+        try:
+            rel_to_drafts = draft_path.relative_to(config.drafts_dir.resolve())
+        except ValueError:
+            log.warning("Draft is outside wiki/.drafts/: %s", draft_path)
+            continue
         target = config.wiki_dir / rel_to_drafts
         target.parent.mkdir(parents=True, exist_ok=True)
 
@@ -749,12 +1087,20 @@ def approve_drafts(
         draft_path.unlink()  # only remove draft after target is safely written
 
         # Update state DB: store published content_hash for edit-protection
-        draft_rel = str(draft_path.relative_to(config.vault))
-        target_rel = str(target.relative_to(config.vault))
+        draft_rel = str(draft_path.relative_to(vault_root))
+        target_rel = str(target.resolve().relative_to(vault_root))
         db.publish_article(draft_rel, target_rel)
 
         # Store content_hash of published body and record approval
         art = db.get_article(target_rel)
+        if art is None:
+            art = WikiArticleRecord(
+                path=target_rel,
+                title=str(meta.get("title", target.stem)),
+                sources=meta.get("sources", []) if isinstance(meta.get("sources"), list) else [],
+                content_hash="",
+                is_draft=False,
+            )
         if art:
             try:
                 _, pub_body = parse_note(target)
@@ -799,7 +1145,11 @@ def reject_draft(
         except Exception:
             pass
 
-    draft_rel = str(draft_path.relative_to(config.vault))
+    try:
+        draft_rel = str(draft_path.relative_to(config.vault.resolve()))
+    except ValueError:
+        log.warning("Draft is outside vault: %s", draft_path)
+        return
     db.delete_article(draft_rel)
     if draft_path.exists():
         draft_path.unlink()

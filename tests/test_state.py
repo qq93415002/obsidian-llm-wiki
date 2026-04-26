@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from obsidian_llm_wiki.models import RawNoteRecord, WikiArticleRecord
+from obsidian_llm_wiki.models import (
+    ItemMentionRecord,
+    KnowledgeItemRecord,
+    RawNoteRecord,
+    WikiArticleRecord,
+)
 from obsidian_llm_wiki.state import _CURRENT_SCHEMA_VERSION, StateDB
 
 
@@ -70,6 +75,15 @@ def test_article_upsert_and_draft(db):
     assert got is not None
     assert got.is_draft is True
     assert got.title == "Test Article"
+
+
+def test_stats_counts_on_disk_drafts(tmp_path):
+    db = StateDB(tmp_path / ".olw" / "state.db")
+    drafts_dir = tmp_path / "wiki" / ".drafts"
+    drafts_dir.mkdir(parents=True)
+    (drafts_dir / "Untracked.md").write_text("---\ntitle: Untracked\n---\nBody.")
+
+    assert db.stats(tmp_path)["drafts"] == 1
 
 
 def test_publish_article(db):
@@ -150,6 +164,14 @@ def test_get_sources_case_insensitive(db):
     assert srcs == ["raw/a.md"]
 
 
+def test_upsert_concepts_backfills_knowledge_items(db):
+    db.upsert_concepts("raw/a.md", ["Quantum Computing"])
+    item = db.get_item("Quantum Computing")
+    assert item is not None
+    assert item.kind == "concept"
+    assert item.status == "confirmed"
+
+
 def test_concepts_needing_compile(db):
     db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
     db.upsert_raw(RawNoteRecord(path="raw/b.md", content_hash="h2", status="compiled"))
@@ -164,6 +186,39 @@ def test_concepts_needing_compile_empty_when_all_compiled(db):
     db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="compiled"))
     db.upsert_concepts("raw/a.md", ["Done Concept"])
     assert db.concepts_needing_compile() == []
+
+
+def test_knowledge_item_crud(db):
+    db.upsert_item(
+        KnowledgeItemRecord(
+            name="Example Reference",
+            kind="ambiguous",
+            subtype="named_reference",
+            status="candidate",
+            confidence=0.6,
+        )
+    )
+    item = db.get_item("example reference")
+    assert item is not None
+    assert item.name == "Example Reference"
+    assert item.subtype == "named_reference"
+    assert db.list_items(kind="ambiguous")[0].name == "Example Reference"
+
+
+def test_item_mentions_idempotent(db):
+    mention = ItemMentionRecord(
+        item_name="Example Reference",
+        source_path="raw/talk.md",
+        mention_text="Example Reference",
+        context="A note about Example Reference",
+        evidence_level="title_supported",
+        confidence=0.7,
+    )
+    db.add_item_mention(mention)
+    db.add_item_mention(mention)
+    mentions = db.get_item_mentions("Example Reference")
+    assert len(mentions) == 1
+    assert mentions[0].source_path == "raw/talk.md"
 
 
 def test_stats(db):

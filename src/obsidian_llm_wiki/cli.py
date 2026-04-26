@@ -16,7 +16,9 @@ Commands:
 
 from __future__ import annotations
 
+import re
 import sys
+import tomllib
 from pathlib import Path
 
 import click
@@ -29,12 +31,85 @@ from rich.table import Table
 console = Console()
 err_console = Console(stderr=True, style="bold red")
 
+_EXPERIMENTAL_CITATIONS_COPY = (
+    "Inline source citations link generated claims back to source pages. "
+    "Experimental: small models may omit citations or add noisy markers. "
+    "Default: off. Turn off later with `olw config inline-source-citations off --vault <path>`."
+)
+
+
+def _format_optional_bool(value: bool | None) -> str:
+    if value is None:
+        return "[dim]not set[/dim]"
+    return "on" if value else "off"
+
+
+class InlineSourceCitationsConfigError(Exception):
+    """Raised when inline citation config cannot be read safely."""
+
+
+def _read_inline_source_citations_setting(toml_path: Path, *, strict: bool = False) -> bool | None:
+
+    if not toml_path.exists():
+        return None
+    try:
+        with open(toml_path, "rb") as f:
+            data = tomllib.load(f)
+    except tomllib.TOMLDecodeError as exc:
+        if strict:
+            raise InlineSourceCitationsConfigError(f"Invalid TOML in {toml_path}: {exc}") from exc
+        return None
+    except OSError as exc:
+        if strict:
+            raise InlineSourceCitationsConfigError(f"Could not read {toml_path}: {exc}") from exc
+        return None
+    pipeline = data.get("pipeline", {})
+    value = pipeline.get("inline_source_citations") if isinstance(pipeline, dict) else None
+    if value is not None and not isinstance(value, bool):
+        if strict:
+            raise InlineSourceCitationsConfigError(
+                "Invalid pipeline.inline_source_citations in "
+                f"{toml_path}: expected boolean true/false, got {type(value).__name__}"
+            )
+        return None
+    return value if isinstance(value, bool) else None
+
+
+def _set_inline_source_citations(toml_path: Path, enabled: bool) -> None:
+    """Patch one pipeline key while preserving unrelated wiki.toml content."""
+    from .vault import atomic_write
+
+    if not toml_path.exists():
+        raise FileNotFoundError(toml_path)
+
+    text = toml_path.read_text(encoding="utf-8")
+    line = f"inline_source_citations = {'true' if enabled else 'false'}"
+    section_match = re.search(r"(?m)^\[pipeline\]\s*$", text)
+
+    if section_match is None:
+        separator = "" if text.endswith("\n") or not text else "\n"
+        atomic_write(toml_path, f"{text}{separator}\n[pipeline]\n{line}\n")
+        return
+
+    section_start = section_match.end()
+    next_section = re.search(r"(?m)^\[[^\]]+\]\s*$", text[section_start:])
+    section_end = section_start + next_section.start() if next_section else len(text)
+    section = text[section_start:section_end]
+    key_re = re.compile(r"(?m)^(\s*)#?\s*inline_source_citations\s*=.*$")
+
+    if key_re.search(section):
+        new_section = key_re.sub(rf"\1{line}", section, count=1)
+    else:
+        insertion = ("" if section.endswith("\n") or not section else "\n") + line + "\n"
+        new_section = section + insertion
+
+    atomic_write(toml_path, text[:section_start] + new_section + text[section_end:])
+
 
 # ── Context helpers ───────────────────────────────────────────────────────────
 
 
-def _load_config(vault_str: str | None, **kwargs):
-    from .config import Config
+def _resolve_vault_path(vault_str: str | None) -> Path:
     from .global_config import load_global_config
 
     if vault_str is None:
@@ -72,7 +147,13 @@ def _load_config(vault_str: str | None, **kwargs):
             err=True,
         )
         sys.exit(1)
-    return Config.from_vault(vault_path, **kwargs)
+    return vault_path
+
+
+def _load_config(vault_str: str | None, **kwargs):
+    from .config import Config
+
+    return Config.from_vault(_resolve_vault_path(vault_str), **kwargs)
 
 
 def _load_db(config):
@@ -133,6 +214,20 @@ def _model_override_kwargs(
     if provider:
         kwargs["provider"] = provider
     return kwargs
+
+
+def _resolve_draft_arg(config, raw_path: str | Path) -> Path:
+    """Resolve a CLI draft argument relative to wiki/.drafts/ when appropriate."""
+    path = Path(raw_path).expanduser()
+    candidates: list[Path]
+    if path.is_absolute():
+        candidates = [path]
+    else:
+        candidates = [config.drafts_dir / path, config.vault / path, path]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return candidates[0].resolve()
 
 
 def _load_deps(config):
@@ -222,6 +317,9 @@ def init(vault_path: str, existing: bool, non_interactive: bool):
                 provider_url=effective_url if provider_name != "ollama" else None,
                 provider_timeout=timeout,
                 azure_api_version=azure_api_version,
+                inline_source_citations=(
+                    bool(gcfg.experimental_inline_source_citations) if gcfg else False
+                ),
             )
         )
     else:
@@ -466,6 +564,10 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
         table.add_row("Fast model", gcfg.fast_model or "[dim]not set[/dim]")
         table.add_row("Heavy model", gcfg.heavy_model or "[dim]not set[/dim]")
         table.add_row("Default vault", gcfg.vault or "[dim]not set[/dim]")
+        table.add_row(
+            "Inline source citations for new vaults",
+            _format_optional_bool(gcfg.experimental_inline_source_citations),
+        )
         console.print(table)
         return
 
@@ -660,6 +762,48 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
         if vault_input.strip():
             vault_path = str(Path(vault_input).expanduser().resolve())
 
+        # ── Experimental features ─────────────────────────────────────────────
+        console.print()
+        step_label = f"Step {6 + step_offset}"
+        console.print(f"  [bold]{step_label}[/bold]  Experimental features (optional)")
+        console.print(f"    {_EXPERIMENTAL_CITATIONS_COPY}")
+        raw_citations = (
+            Prompt.ask(
+                "    Enable inline source citations for new vaults?",
+                choices=["y", "n"],
+                default="n",
+                show_choices=False,
+                console=console,
+            )
+            .strip()
+            .lower()
+        )
+        experimental_inline_source_citations = raw_citations == "y"
+
+        applied_to_existing_vault = False
+        current_vault_setting: bool | None = None
+        current_toml_exists = False
+        if vault_path:
+            current_toml = Path(vault_path) / "wiki.toml"
+            current_toml_exists = current_toml.exists()
+            current_vault_setting = _read_inline_source_citations_setting(current_toml)
+            if current_toml_exists:
+                apply_now = (
+                    Prompt.ask(
+                        f"    Apply this setting to {current_toml} now?",
+                        choices=["y", "n"],
+                        default="n",
+                        show_choices=False,
+                        console=console,
+                    )
+                    .strip()
+                    .lower()
+                )
+                if apply_now == "y":
+                    _set_inline_source_citations(current_toml, experimental_inline_source_citations)
+                    current_vault_setting = experimental_inline_source_citations
+                    applied_to_existing_vault = True
+
         # ── Save ──────────────────────────────────────────────────────────────
         # Preserve existing azure_api_version so re-running setup doesn't reset it.
         existing_cfg = load_global_config()
@@ -682,6 +826,7 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
             provider_url=provider_url,
             api_key=api_key,
             azure_api_version=azure_api_ver,
+            experimental_inline_source_citations=experimental_inline_source_citations,
         )
         save_global_config(cfg)
 
@@ -700,6 +845,25 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
             summary_lines.append(f"  Heavy model:  [bold]{heavy_model}[/bold]")
         if vault_path:
             summary_lines.append(f"  Vault:        {vault_path}")
+        summary_lines.append(
+            "  Inline source citations: "
+            f"{'on' if experimental_inline_source_citations else 'off'} for new vaults"
+        )
+        if vault_path:
+            if current_toml_exists:
+                current_display = (
+                    _format_optional_bool(current_vault_setting)
+                    if current_vault_setting is not None
+                    else "[dim]not set (default: off)[/dim]"
+                )
+                suffix = " [dim](updated)[/dim]" if applied_to_existing_vault else ""
+            else:
+                current_display = (
+                    f"[dim]not initialized yet; will be "
+                    f"{'on' if experimental_inline_source_citations else 'off'} after init[/dim]"
+                )
+                suffix = ""
+            summary_lines.append(f"  Current vault: {current_display}{suffix}")
         summary_lines += [
             "",
             "  Next steps:",
@@ -714,6 +878,51 @@ def setup(non_interactive: bool, reset: bool, provider_preset: str | None):
     except (EOFError, KeyboardInterrupt):
         console.print("\n[yellow]Setup interrupted.[/yellow]")
         sys.exit(1)
+
+
+# ── config ───────────────────────────────────────────────────────────────────
+
+
+@cli.group(name="config")
+def config_cmd():
+    """Inspect or update vault-local configuration."""
+
+
+@config_cmd.command(name="inline-source-citations")
+@click.argument("action", type=click.Choice(["on", "off", "status"]))
+@click.option("--vault", "vault_str", envvar="OLW_VAULT", default=None)
+def config_inline_source_citations(action: str, vault_str: str | None):
+    """Enable, disable, or inspect inline source citations for one vault."""
+    vault_path = _resolve_vault_path(vault_str)
+    toml_path = vault_path / "wiki.toml"
+    if not toml_path.exists():
+        click.echo(
+            f"Error: {toml_path} not found. Run `olw init {vault_path}` first.",
+            err=True,
+        )
+        sys.exit(1)
+
+    if action == "status":
+        try:
+            setting = _read_inline_source_citations_setting(toml_path, strict=True)
+        except InlineSourceCitationsConfigError as exc:
+            click.echo(f"Error: {exc}", err=True)
+            sys.exit(1)
+        if setting is None:
+            status = "not set (default: disabled)"
+        else:
+            status = "enabled" if setting else "disabled"
+        console.print(f"inline_source_citations: {status} in {toml_path}")
+        return
+
+    enabled = action == "on"
+    _set_inline_source_citations(toml_path, enabled)
+    console.print(f"inline_source_citations = {'true' if enabled else 'false'} in {toml_path}")
+    if enabled:
+        console.print(
+            "[dim]Turn off later with `olw config inline-source-citations off --vault "
+            f"{vault_path}`.[/dim]"
+        )
 
 
 # ── ingest ────────────────────────────────────────────────────────────────────
@@ -961,7 +1170,7 @@ def approve(vault_str, approve_all, files):
     if approve_all:
         paths = None  # approve_drafts handles all
     elif files:
-        paths = [Path(f) for f in files]
+        paths = [_resolve_draft_arg(config, f) for f in files]
     else:
         click.echo("Specify --all or file paths.", err=True)
         sys.exit(1)
@@ -1009,7 +1218,7 @@ def reject(vault_str, reject_all, feedback, files):
         if not feedback:
             feedback = click.prompt("Reason for rejecting all drafts?", default="")
     elif files:
-        draft_paths = [Path(f).resolve() for f in files]
+        draft_paths = [_resolve_draft_arg(config, f) for f in files]
         for p in draft_paths:
             if not p.exists():
                 click.echo(f"File not found: {p}", err=True)
@@ -1058,10 +1267,12 @@ def reject(vault_str, reject_all, feedback, files):
 @click.option("--failed", "show_failed", is_flag=True, help="List failed notes with error messages")
 def status(vault_str, show_failed):
     """Show vault health, pending drafts, and pipeline stats."""
+    from .models import WikiArticleRecord
+
     config = _load_config(vault_str)
     db = _load_db(config)
 
-    stats = db.stats()
+    stats = db.stats(config.vault)
     raw = stats.get("raw", {})
 
     table = Table(title="Vault Status", show_header=True)
@@ -1079,6 +1290,23 @@ def status(vault_str, show_failed):
 
     # List pending drafts
     drafts = db.list_articles(drafts_only=True)
+    known_draft_paths = {article.path for article in drafts}
+    if config.drafts_dir.exists():
+        from .vault import list_draft_articles
+
+        for title, path, sources in list_draft_articles(config.drafts_dir):
+            rel_path = str(path.relative_to(config.vault))
+            if rel_path in known_draft_paths:
+                continue
+            drafts.append(
+                WikiArticleRecord(
+                    path=rel_path,
+                    title=title,
+                    sources=sources,
+                    content_hash="",
+                    is_draft=True,
+                )
+            )
     if drafts:
         console.print(f"\n[bold]{len(drafts)} draft(s) pending review:[/bold]")
         for article in drafts:
@@ -1107,7 +1335,7 @@ def status(vault_str, show_failed):
         console.print('[dim]Run [bold]olw unblock "Concept"[/bold] to re-enable.[/dim]')
 
     # Show pipeline lock status
-    from .pipeline.lock import lock_holder_pid
+    from .pipeline.lock import has_invalid_lock_file, lock_holder_pid
 
     pid = lock_holder_pid(config.vault)
     if pid is not None:
@@ -1118,6 +1346,8 @@ def status(vault_str, show_failed):
             console.print(f"\n[yellow]⚠ Pipeline lock held by PID {pid}[/yellow]")
         except (ProcessLookupError, PermissionError):
             console.print(f"\n[dim]Lock file present (PID {pid}) but process not running[/dim]")
+    elif has_invalid_lock_file(config.vault):
+        console.print("\n[dim]Lock file present but invalid; no live process holds it[/dim]")
 
 
 # ── undo ─────────────────────────────────────────────────────────────────────
@@ -1257,12 +1487,46 @@ def doctor(vault_str):
 
     # ── Vault stats ───────────────────────────────────────────────────────────
     console.print("\n[bold]Vault stats[/bold]")
-    stats = db.stats()
+    stats = db.stats(config.vault)
     raw = stats.get("raw", {})
     console.print(f"  Raw notes:         {sum(raw.values())}")
     console.print(f"  Ingested:          {raw.get('ingested', 0) + raw.get('compiled', 0)}")
     console.print(f"  Drafts pending:    {stats['drafts']}")
     console.print(f"  Published:         {stats['published']}")
+
+    draft_graph_filter = [
+        "-path:raw",
+        "-path:wiki/sources",
+        "-path:_resources",
+        "-file:Welcome",
+    ]
+    published_graph_filter = [
+        "-path:raw",
+        "-path:wiki/sources",
+        "-path:wiki/.drafts",
+        "-path:_resources",
+        "-file:Welcome",
+    ]
+    graph_notes: list[str] = []
+    if (config.vault / "Welcome.md").exists():
+        graph_notes.append("Welcome.md is present and can create starter graph noise")
+    if config.raw_dir.exists() and any(config.raw_dir.rglob("*.md")):
+        graph_notes.append("raw/ notes are visible unless filtered")
+    if config.sources_dir.exists() and any(config.sources_dir.glob("*.md")):
+        graph_notes.append("wiki/sources/ pages can dominate graph when citations are enabled")
+    if config.drafts_dir.exists() and any(config.drafts_dir.rglob("*.md")):
+        graph_notes.append("wiki/.drafts/ pages are review artifacts, not published wiki")
+
+    console.print("\n[bold]Graph view[/bold]")
+    if graph_notes:
+        for note in graph_notes:
+            console.print(f"  [yellow]![/yellow] {note}")
+    else:
+        console.print("  [green]✓[/green] No obvious graph-noise layers detected")
+    console.print("  Draft review graph filter:")
+    console.print(f"  [dim]{' '.join(draft_graph_filter)}[/dim]")
+    console.print("  Published-only graph filter:")
+    console.print(f"  [dim]{' '.join(published_graph_filter)}[/dim]")
 
     console.print()
     if ok:
@@ -1822,6 +2086,65 @@ def unblock(vault_str, concept):
     console.print(
         f"[dim]{count} rejection(s) remain on record. Next compile will include this concept.[/dim]"
     )
+
+
+# ── items ─────────────────────────────────────────────────────────────────────
+
+
+@cli.group()
+def items():
+    """Audit preserved non-concept knowledge item candidates."""
+
+
+@items.command("audit")
+@click.option("--vault", "vault_str", envvar="OLW_VAULT", default=None)
+@click.option("--limit", default=30, show_default=True, help="Maximum items to show")
+def items_audit(vault_str, limit):
+    """Show ambiguous/entity candidates preserved during ingest."""
+    config = _load_config(vault_str)
+    db = _load_db(config)
+    candidates = [item for item in db.list_items(status="candidate") if item.kind != "concept"]
+    if not candidates:
+        console.print("[green]No candidate knowledge items found.[/green]")
+        return
+
+    console.print(f"[bold]{len(candidates)} candidate knowledge item(s)[/bold]\n")
+    for item in candidates[:limit]:
+        mentions = db.get_item_mentions(item.name)
+        console.print(
+            f"[yellow]{item.name}[/yellow]  "
+            f"kind={item.kind} subtype={item.subtype or 'unknown'} "
+            f"confidence={item.confidence:.2f} mentions={len(mentions)}"
+        )
+        for mention in mentions[:3]:
+            console.print(
+                f"  - {mention.evidence_level}: {mention.source_path} ({mention.mention_text})"
+            )
+        console.print("  suggested: classify / ignore / keep candidate\n")
+
+
+@items.command("show")
+@click.option("--vault", "vault_str", envvar="OLW_VAULT", default=None)
+@click.argument("name")
+def items_show(vault_str, name):
+    """Show one preserved knowledge item and its mentions."""
+    config = _load_config(vault_str)
+    db = _load_db(config)
+    item = db.get_item(name)
+    if item is None:
+        console.print(f"[red]Item not found:[/red] {name}")
+        raise SystemExit(1)
+    console.print(f"[bold]{item.name}[/bold]")
+    console.print(f"  kind: {item.kind}")
+    console.print(f"  subtype: {item.subtype or 'unknown'}")
+    console.print(f"  status: {item.status}")
+    console.print(f"  confidence: {item.confidence:.2f}")
+    mentions = db.get_item_mentions(item.name)
+    console.print(f"\n[bold]Mentions ({len(mentions)})[/bold]")
+    for mention in mentions:
+        console.print(f"- {mention.evidence_level}: {mention.source_path}")
+        if mention.context:
+            console.print(f"  {mention.context}")
 
 
 # ── compare ───────────────────────────────────────────────────────────────────

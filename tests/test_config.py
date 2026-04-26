@@ -13,6 +13,23 @@ def test_pipeline_config_language_default_none():
     assert cfg.language is None
 
 
+def test_pipeline_config_inline_source_citations_default_false():
+    cfg = PipelineConfig()
+    assert cfg.inline_source_citations is False
+
+
+def test_pipeline_config_graph_defaults():
+    cfg = PipelineConfig()
+    assert cfg.source_citation_style == "legend-only"
+    assert cfg.draft_media == "reference"
+    assert cfg.graph_quality_checks is True
+
+
+def test_pipeline_config_inline_source_citations_from_dict():
+    cfg = PipelineConfig(**{"inline_source_citations": True})
+    assert cfg.inline_source_citations is True
+
+
 def test_pipeline_config_language_from_dict():
     cfg = PipelineConfig(**{"language": "fr"})
     assert cfg.language == "fr"
@@ -31,6 +48,61 @@ def test_default_wiki_toml_contains_language_comment():
     toml = default_wiki_toml()
     assert "language" in toml
     assert "ISO 639-1" in toml
+
+
+def test_default_wiki_toml_contains_inline_source_citations_comment():
+    toml = default_wiki_toml()
+    assert "inline_source_citations" in toml
+    assert "Experimental" in toml
+
+
+def test_default_wiki_toml_contains_graph_quality_defaults():
+    toml = default_wiki_toml()
+    assert "source_citation_style" in toml
+    assert "draft_media" in toml
+    assert "graph_quality_checks = true" in toml
+
+
+def test_default_wiki_toml_can_enable_inline_source_citations():
+    toml = default_wiki_toml(inline_source_citations=True)
+    data = tomllib.loads(toml)
+    assert data["pipeline"]["inline_source_citations"] is True
+
+
+def test_from_vault_loads_inline_source_citations(tmp_path):
+    _write_wiki_toml(
+        tmp_path,
+        """
+[models]
+fast = "gemma4:e4b"
+heavy = "gemma4:e4b"
+
+[pipeline]
+inline_source_citations = true
+""",
+    )
+    cfg = Config.from_vault(tmp_path)
+    assert cfg.pipeline.inline_source_citations is True
+
+
+def test_from_vault_loads_graph_quality_config(tmp_path):
+    _write_wiki_toml(
+        tmp_path,
+        """
+[models]
+fast = "gemma4:e4b"
+heavy = "gemma4:e4b"
+
+[pipeline]
+source_citation_style = "inline-wikilink"
+draft_media = "embed"
+graph_quality_checks = false
+""",
+    )
+    cfg = Config.from_vault(tmp_path)
+    assert cfg.pipeline.source_citation_style == "inline-wikilink"
+    assert cfg.pipeline.draft_media == "embed"
+    assert cfg.pipeline.graph_quality_checks is False
 
 
 def test_pipeline_config_accepts_explicit_language():
