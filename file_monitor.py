@@ -271,25 +271,38 @@ def monitor_loop(interval=10, clean_start=False):
         try:
             current_files = get_all_monitored_files(target_dirs, extensions)
 
+            print(f"\n本次扫描到 {len(current_files)} 个文件")
+            print(f"状态文件中 {len(state)} 个文件")
+
             for filepath, info in current_files.items():
-                if filepath not in state:
+                is_new = filepath not in state
+                is_modified = not is_new and info['mtime'] > state[filepath]['mtime']
+                is_size_changed = not is_new and info['size'] != state[filepath]['size']
+
+                if is_new:
                     print(f"[新增] {filepath}")
-                    process_file(filepath, info, target_dirs)
-                elif info['mtime'] > state[filepath]['mtime']:
+                elif is_modified:
                     print(f"[修改] {filepath}")
-                    process_file(filepath, info, target_dirs)
-                elif info['size'] != state[filepath]['size']:
+                elif is_size_changed:
                     print(f"[大小变化] {filepath}")
-                    process_file(filepath, info, target_dirs)
+                else:
+                    print(f"[跳过(未变化)] {os.path.basename(filepath)}")
+
+                if is_new or is_modified or is_size_changed:
+                    result = process_file(filepath, info, target_dirs)
+                    if result:
+                        print(f"    [成功] -> {result}")
+                    else:
+                        print(f"    [失败]")
 
                 state[filepath] = info
+                save_state(state)
 
             for filepath in list(state.keys()):
                 if filepath not in current_files:
                     print(f"[删除] {filepath}")
                     del state[filepath]
-
-            save_state(state)
+                    save_state(state)
 
         except Exception as e:
             print(f"[监控出错] {e}")
