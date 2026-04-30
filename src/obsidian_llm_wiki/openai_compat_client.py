@@ -157,12 +157,21 @@ class OpenAICompatClient:
     def healthcheck(self) -> bool:
         try:
             resp = self._client.get(self._models_url(), timeout=5)
-            # 200 = healthy + auth ok; 401 = service running but wrong key
+            if resp.status_code == 404:
+                if self._is_local_provider():
+                    return False
+                return True
             return resp.status_code in (200, 401)
         except (httpx.ConnectError, httpx.TimeoutException):
             return False
         except Exception:
             return False
+
+    def _is_local_provider(self) -> bool:
+        return self.provider_name in (
+            "ollama", "lm_studio", "vllm", "llama_cpp",
+            "localai", "tgi", "sglang", "llamafile", "lemonade",
+        )
 
     def require_healthy(self) -> None:
         if not self.healthcheck():
