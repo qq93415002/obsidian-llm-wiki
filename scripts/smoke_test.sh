@@ -109,6 +109,61 @@ cleanup() {
 }
 trap cleanup EXIT
 
+resolve_loaded_model() {
+    local model="$1"
+    uv run python - <<'PY' "$PROVIDER" "$PROVIDER_URL" "$model"
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+from obsidian_llm_wiki.client_factory import build_client
+from obsidian_llm_wiki.config import Config
+
+provider, url, model = sys.argv[1:4]
+
+
+def norm(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+with tempfile.TemporaryDirectory(prefix="smoke-model-resolve-") as tmp:
+    vault = Path(tmp)
+    (vault / "raw").mkdir()
+    (vault / "wiki").mkdir()
+    (vault / ".olw").mkdir()
+    (vault / "wiki.toml").write_text(
+        f"[models]\nfast = \"{model}\"\nheavy = \"{model}\"\n\n"
+        f"[provider]\nname = \"{provider}\"\nurl = \"{url}\"\n",
+        encoding="utf-8",
+    )
+    cfg = Config.from_vault(vault)
+    client = build_client(cfg)
+    try:
+        client.require_healthy()
+        models = client.list_models()
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+if model in models:
+    print(model)
+    raise SystemExit(0)
+
+wanted = norm(model)
+matches = [m for m in models if wanted == norm(m) or wanted in norm(m) or norm(m) in wanted]
+if len(matches) == 1:
+    print(matches[0])
+    raise SystemExit(0)
+
+raise SystemExit(
+    f"Model {model!r} is not loaded in {provider} at {url}. Available: {models}"
+)
+PY
+}
+
 # ── Prerequisites ─────────────────────────────────────────────────────────────
 header "Prerequisites (provider: $PROVIDER)"
 
@@ -132,6 +187,11 @@ else
     # Model presence can't be checked reliably via /v1/models on all backends.
     check "$PROVIDER reachable at $PROVIDER_URL" "curl -sf $PROVIDER_URL/models"
     info "Model pull skipped ($PROVIDER manages its own models — load $FAST_MODEL in $PROVIDER before running)"
+    FAST_MODEL="$(resolve_loaded_model "$FAST_MODEL")"
+    HEAVY_MODEL="$(resolve_loaded_model "$HEAVY_MODEL")"
+    pass "Fast model resolved: $FAST_MODEL"
+    pass "Heavy model resolved: $HEAVY_MODEL"
+    PASS_COUNT=$((PASS_COUNT + 2))
 fi
 
 # ── Install ───────────────────────────────────────────────────────────────────
@@ -759,6 +819,27 @@ echo "$QUERY_SAVE_OUT"
 check "query --save exits 0" "test $_QS_RC -eq 0"
 QUERY_COUNT=$(find "$VAULT_DIR/wiki/queries" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
 check "query --save creates file in wiki/queries/" "test \"$QUERY_COUNT\" -ge 1"
+
+info "Running query with --synthesize..."
+_QSY_RC=0
+QUERY_SYNTH_OUT=$($OLW query --synthesize "What algorithms are used in quantum computing?" 2>&1) || _QSY_RC=$?
+echo "$QUERY_SYNTH_OUT"
+check "query --synthesize exits 0" "test $_QSY_RC -eq 0"
+SYNTH_COUNT=$(find "$VAULT_DIR/wiki/synthesis" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+check "query --synthesize creates file in wiki/synthesis/" "test \"$SYNTH_COUNT\" -ge 1"
+_SYNTH_FILE=$(find "$VAULT_DIR/wiki/synthesis" -name "*.md" | head -1)
+check "synthesis frontmatter records kind" "grep -q '^kind: synthesis' \"$_SYNTH_FILE\""
+check "synthesis frontmatter records question hash" "grep -q '^question_hash:' \"$_SYNTH_FILE\""
+check "synthesis includes sources section" "grep -q '^## Sources' \"$_SYNTH_FILE\""
+check "index lists synthesis section" "grep -q '^## Synthesis' \"$VAULT_DIR/wiki/index.md\""
+
+info "Re-running query with --synthesize to check duplicate handling..."
+_QSY2_RC=0
+QUERY_SYNTH_DUP_OUT=$($OLW query --synthesize "What algorithms are used in quantum computing?" 2>&1) || _QSY2_RC=$?
+echo "$QUERY_SYNTH_DUP_OUT"
+check "duplicate query --synthesize exits 0" "test $_QSY2_RC -eq 0"
+SYNTH_COUNT_AFTER=$(find "$VAULT_DIR/wiki/synthesis" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+check "duplicate query --synthesize keeps existing file" "test \"$SYNTH_COUNT_AFTER\" = \"$SYNTH_COUNT\""
 
 # ── Lint (Stage 3) ────────────────────────────────────────────────────────────
 header "olw lint (Stage 3)"

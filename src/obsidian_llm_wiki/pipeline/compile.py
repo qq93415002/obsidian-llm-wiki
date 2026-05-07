@@ -27,7 +27,7 @@ import frontmatter as fm_lib
 
 from ..config import Config
 from ..models import ArticlePlan, CompilePlan, SingleArticle, WikiArticleRecord
-from ..openai_compat_client import LLMBadRequestError
+from ..openai_compat_client import LLMBadRequestError, LLMTruncatedError
 from ..protocols import LLMClientProtocol
 from ..sanitize import sanitize_tags
 from ..state import StateDB
@@ -112,20 +112,53 @@ _BUDGET_SAFETY = 200  # buffer
 
 _QUALITY_BONUS = {"high": 0.25, "medium": 0.1, "low": 0.0}
 
-# Max tokens to request for article / stub generation.
-# Real-world articles peak at ~2000 words ≈ 3000 tokens; 4096 gives headroom.
-# Keeping these well below typical model context windows avoids LM Studio's
-# "tokens to keep from initial prompt > context length" error (triggered when
-# max_tokens >= model's loaded n_ctx).
-_MAX_ARTICLE_PREDICT = 4096  # covers ~2700 word articles
-_MAX_STUB_PREDICT = 512  # stubs capped at 150 words ≈ 200 tokens
+# Stubs are short by design (≤150 words). Hardcoded cap is intentional.
+_MAX_STUB_PREDICT = 512
+
+# Math floor: structured generation needs enough headroom for title + content + tags.
+# Below this, JSON schema can't reliably complete.
+_MIN_ARTICLE_PREDICT = 512
 
 
 def _content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _build_olw_annotations(confidence: float, source_paths: list[str], db: StateDB) -> list[str]:
+def _categorize_failure(exc: Exception) -> str:
+    """Map an exception type to a stable category string used in compile summaries."""
+    if isinstance(exc, LLMTruncatedError):
+        return "truncated"
+    if isinstance(exc, LLMBadRequestError):
+        return "bad_request"
+    if isinstance(exc, StructuredOutputError):
+        return "structured_output"
+    return "other"
+
+
+def _article_num_predict(config: Config, prompt: str, system: str) -> int:
+    """Return num_predict capped by both user config and remaining context budget.
+
+    Raises ValueError if the available output budget is below the floor needed for
+    reliable structured generation — caller should treat this as a per-article
+    failure (sources too large for context), not a global crash.
+    """
+    estimated_prompt_tokens = max(1, len(system + prompt) // 4)
+    available_output = config.effective_provider.heavy_ctx - estimated_prompt_tokens - 256
+    if available_output < _MIN_ARTICLE_PREDICT:
+        raise ValueError(
+            f"Source content too large for heavy_ctx={config.effective_provider.heavy_ctx}: "
+            f"prompt ~{estimated_prompt_tokens} tokens leaves only {available_output} "
+            f"for output (need >= {_MIN_ARTICLE_PREDICT}). Reduce sources or raise heavy_ctx."
+        )
+    return max(_MIN_ARTICLE_PREDICT, min(config.pipeline.article_max_tokens, available_output))
+
+
+def _build_olw_annotations(
+    confidence: float,
+    source_paths: list[str],
+    db: StateDB,
+    prompt_degraded: bool = False,
+) -> list[str]:
     """Return HTML comment annotations for low-quality drafts. Empty list = no annotations."""
     annotations = []
     if confidence < _ANNOTATION_CONFIDENCE_THRESHOLD:
@@ -142,6 +175,12 @@ def _build_olw_annotations(confidence: float, source_paths: list[str], db: State
                 qualities.append(rec.quality)
         if qualities and all(q == "low" for q in qualities):
             annotations.append("<!-- olw-auto: all sources low-quality — add better sources -->")
+    if prompt_degraded:
+        annotations.append(
+            "<!-- olw-auto: prompt degraded to fit provider context — some source or "
+            "existing article context was trimmed; review carefully and consider increasing "
+            "the loaded model context or lowering heavy_ctx -->"
+        )
     return annotations
 
 
@@ -156,6 +195,19 @@ def _truncate_to_budget(text: str, max_chars: int) -> str:
     if len(text) > limit:
         return text[:limit] + "\n\n[...truncated...]"
     return text
+
+
+def _is_prompt_context_overflow(error: Exception) -> bool:
+    """Detect provider errors where the prompt itself exceeds the loaded context."""
+    if not isinstance(error, LLMBadRequestError):
+        return False
+    message = str(error).lower()
+    return (
+        "tokens to keep" in message
+        or "n_keep" in message
+        or "context length" in message
+        or "context too long" in message
+    )
 
 
 def _resolve_source_path(source_path: str, vault: Path) -> tuple[Path, str] | None:
@@ -327,6 +379,20 @@ def _strip_self_wikilinks(content: str, article_title: str) -> str:
         return display or target
 
     return wikilink_re.sub(replace, content)
+
+
+def _strip_empty_wikilinks(content: str) -> str:
+    """Remove malformed empty wikilinks like [[]] or [[|display]]."""
+    masked, replacements = _mask_code_blocks(content)
+    empty_wikilink_re = re.compile(r"\[\[(?:\s*\|\s*([^\]]*))?\s*\]\]")
+
+    def replace(match: re.Match[str]) -> str:
+        display = match.group(1)
+        if display is None:
+            return ""
+        return display.strip()
+
+    return _restore_code_blocks(empty_wikilink_re.sub(replace, masked), replacements)
 
 
 def _repair_literal_newlines(content: str) -> str:
@@ -514,6 +580,7 @@ def _write_draft(
     concept_aliases: list[str] | None = None,
     alias_map: dict[str, str] | None = None,
     canonical_title: str | None = None,
+    prompt_degraded: bool = False,
 ) -> Path:
     """Write SingleArticle to wiki/.drafts/ and record in state DB."""
     config.drafts_dir.mkdir(parents=True, exist_ok=True)
@@ -542,6 +609,7 @@ def _write_draft(
     body = _repair_malformed_wikilinks(body, (existing_titles or []) + source_targets)
     body = _strip_unknown_wikilinks(body, (existing_titles or []) + source_targets)
     body = _strip_self_wikilinks(body, article_title)
+    body = _strip_empty_wikilinks(body)
     body = _repair_malformed_embeds(body)
     body = _remove_dangling_open_brackets(body)
     body = _apply_draft_media_mode(body, config.pipeline.draft_media)
@@ -554,7 +622,12 @@ def _write_draft(
     )
 
     # Prepend quality annotations (invisible HTML comments, stripped on approve)
-    annotations = _build_olw_annotations(confidence, source_paths, db)
+    annotations = _build_olw_annotations(
+        confidence,
+        source_paths,
+        db,
+        prompt_degraded=prompt_degraded,
+    )
     if annotations:
         annotation_block = "\n".join(annotations) + "\n\n"
         # Insert before first ## heading if present, else prepend
@@ -641,6 +714,42 @@ def _write_concept_prompt(
     return prompt
 
 
+def _build_concept_write_prompt(
+    name: str,
+    source_paths: list[str],
+    config: Config,
+    link_titles: list[str],
+    existing_content: str,
+    vault_schema: str,
+    rejection_history: list[str] | None,
+    db: StateDB,
+) -> tuple[str, list[str], float, str | None]:
+    source_refs = (
+        _build_source_refs(source_paths, config.vault)
+        if config.pipeline.inline_source_citations
+        else None
+    )
+    sources_text, resolved_paths = _gather_sources(
+        source_paths,
+        config.vault,
+        max_chars=config.effective_provider.heavy_ctx // 2,
+        source_refs=source_refs,
+    )
+    confidence = _compute_confidence(resolved_paths, db)
+    lang = _resolve_language([str(p) for p in resolved_paths], db, config)
+    write_prompt = _write_concept_prompt(
+        name,
+        sources_text,
+        link_titles,
+        existing_content,
+        vault_schema,
+        rejection_history,
+        language=lang,
+        inline_source_citations=config.pipeline.inline_source_citations,
+    )
+    return write_prompt, resolved_paths, confidence, lang
+
+
 def compile_concepts(
     config: Config,
     client: LLMClientProtocol,
@@ -663,8 +772,15 @@ def compile_concepts(
     """
     all_needing = db.concepts_needing_compile()
     if concepts is not None:
-        concept_set = set(concepts)
-        concept_names = [c for c in all_needing if c in concept_set]
+        requested: list[str] = []
+        seen: set[str] = set()
+        for name in concepts:
+            canonical = db.resolve_alias(name) or name
+            key = canonical.casefold()
+            if key not in seen:
+                seen.add(key)
+                requested.append(canonical)
+        concept_names = requested
     else:
         concept_names = all_needing
 
@@ -686,7 +802,14 @@ def compile_concepts(
 
     draft_paths: list[Path] = []
     failed: list[str] = []
+    failure_categories: dict[str, list[str]] = {}
     concept_timings: dict[str, float] = {}
+
+    def _record_failure(name: str, category: str) -> None:
+        if name not in failed:
+            failed.append(name)
+        failure_categories.setdefault(category, []).append(name)
+
     for idx, name in enumerate(concept_names, 1):
         if on_progress:
             on_progress(idx, total, name)
@@ -694,6 +817,7 @@ def compile_concepts(
 
         source_paths = db.get_sources_for_concept(name)
         is_stub = db.has_stub(name)
+        prompt_degraded = False
 
         if not source_paths and not is_stub:
             continue
@@ -711,6 +835,7 @@ def compile_concepts(
             log.info(
                 "Skipping '%s' — draft already pending review (use --force to overwrite)", name
             )
+            db.mark_concept_compile_state(name, source_paths, "deferred_draft")
             continue
 
         if wiki_path.exists():
@@ -723,9 +848,13 @@ def compile_concepts(
                             print(f"  [skip] {name} — published article manually edited")
                             continue
                         log.info("Skipping '%s' — manually edited (use --force to override)", name)
+                        db.mark_concept_compile_state(name, source_paths, "deferred_manual_edit")
                         continue
             except Exception:
                 pass
+
+        if force:
+            db.clear_deferred_state(name, source_paths)
 
         if dry_run:
             stub_tag = " [stub]" if is_stub else ""
@@ -753,9 +882,10 @@ def compile_concepts(
                     num_predict=min(_MAX_STUB_PREDICT, config.effective_provider.fast_ctx),
                     stage="compile_article",
                 )
-            except (StructuredOutputError, LLMBadRequestError) as e:
+            except (StructuredOutputError, LLMBadRequestError, LLMTruncatedError) as e:
                 log.error("Failed to write stub '%s': %s", name, e)
-                failed.append(name)
+                _record_failure(name, _categorize_failure(e))
+                db.mark_concept_compile_state(name, source_paths, "failed", error=str(e))
                 continue
             draft_path = _write_draft(
                 content_result=result,
@@ -771,29 +901,11 @@ def compile_concepts(
             )
             draft_paths.append(draft_path)
             db.delete_stub(name)
+            db.mark_concept_compile_state(name, source_paths, "compiled")
             elapsed = time.monotonic() - _t_concept
             concept_timings[name] = elapsed
             log.info("Stub draft written: %s (%.1fs)", draft_path.name, elapsed)
             continue
-
-        # Gather source material within context budget
-        source_refs = (
-            _build_source_refs(source_paths, config.vault)
-            if config.pipeline.inline_source_citations
-            else None
-        )
-        sources_text, resolved_paths = _gather_sources(
-            source_paths,
-            config.vault,
-            max_chars=config.effective_provider.heavy_ctx // 2,
-            source_refs=source_refs,
-        )
-        if not resolved_paths:
-            log.warning("No readable sources for concept '%s', skipping", name)
-            failed.append(name)
-            continue
-
-        confidence = _compute_confidence(resolved_paths, db)
 
         # Include snippet of existing article for update prompts
         existing_content = ""
@@ -810,17 +922,40 @@ def compile_concepts(
             [r["feedback"] for r in rejection_records] if rejection_records else None
         )
 
-        lang = _resolve_language([str(p) for p in resolved_paths], db, config)
-        write_prompt = _write_concept_prompt(
+        # Gather source material within context budget
+        write_prompt, resolved_paths, confidence, _ = _build_concept_write_prompt(
             name,
-            sources_text,
+            source_paths,
+            config,
             link_titles,
             existing_content,
             vault_schema,
             rejection_history,
-            language=lang,
-            inline_source_citations=config.pipeline.inline_source_citations,
+            db,
         )
+        if not resolved_paths:
+            log.warning("No readable sources for concept '%s', skipping", name)
+            _record_failure(name, "no_sources")
+            db.mark_concept_compile_state(name, source_paths, "failed", error="No readable sources")
+            continue
+
+        try:
+            num_predict = _article_num_predict(
+                config,
+                write_prompt,
+                (
+                    _WRITE_SYSTEM_WITH_CITATIONS
+                    if config.pipeline.inline_source_citations
+                    else _WRITE_SYSTEM
+                ),
+            )
+        except ValueError as e:
+            log.error("Failed to write '%s': %s", name, e)
+            _record_failure(name, "context_too_large")
+            db.mark_concept_compile_state(
+                name, resolved_paths or source_paths, "failed", error=str(e)
+            )
+            continue
 
         try:
             result = request_structured(
@@ -834,13 +969,115 @@ def compile_concepts(
                     else _WRITE_SYSTEM
                 ),
                 num_ctx=config.effective_provider.heavy_ctx,
-                num_predict=min(_MAX_ARTICLE_PREDICT, config.effective_provider.heavy_ctx),
+                num_predict=num_predict,
                 stage="compile_article",
             )
-        except (StructuredOutputError, LLMBadRequestError) as e:
-            log.error("Failed to write '%s': %s", name, e)
-            failed.append(name)
-            continue
+        except (StructuredOutputError, LLMBadRequestError, LLMTruncatedError) as e:
+            retry_succeeded = False
+            if _is_prompt_context_overflow(e):
+                retry_plan = [
+                    (max(512, config.effective_provider.heavy_ctx // 4), 1000),
+                    (max(512, config.effective_provider.heavy_ctx // 8), 500),
+                    (max(512, config.effective_provider.heavy_ctx // 16), 0),
+                    (512, 0),
+                ]
+                source_refs = (
+                    _build_source_refs(source_paths, config.vault)
+                    if config.pipeline.inline_source_citations
+                    else None
+                )
+                seen_retry_budgets: set[tuple[int, int]] = set()
+                for source_budget, existing_budget in retry_plan:
+                    retry_key = (source_budget, existing_budget)
+                    if retry_key in seen_retry_budgets:
+                        continue
+                    seen_retry_budgets.add(retry_key)
+                    log.warning(
+                        "Retrying '%s' after provider context overflow (sources=%d, existing=%d)",
+                        name,
+                        source_budget,
+                        existing_budget,
+                    )
+                    fallback_sources_text, fallback_resolved_paths = _gather_sources(
+                        source_paths,
+                        config.vault,
+                        max_chars=source_budget,
+                        source_refs=source_refs,
+                    )
+                    if not fallback_resolved_paths:
+                        continue
+                    fallback_lang = _resolve_language(
+                        [str(p) for p in fallback_resolved_paths], db, config
+                    )
+                    fallback_prompt = _write_concept_prompt(
+                        name,
+                        fallback_sources_text,
+                        link_titles,
+                        existing_content[:existing_budget] if existing_budget else "",
+                        vault_schema,
+                        rejection_history,
+                        language=fallback_lang,
+                        inline_source_citations=config.pipeline.inline_source_citations,
+                    )
+                    try:
+                        fallback_num_predict = _article_num_predict(
+                            config,
+                            fallback_prompt,
+                            (
+                                _WRITE_SYSTEM_WITH_CITATIONS
+                                if config.pipeline.inline_source_citations
+                                else _WRITE_SYSTEM
+                            ),
+                        )
+                    except ValueError as retry_error:
+                        e = retry_error
+                        continue
+                    try:
+                        result = request_structured(
+                            client=client,
+                            prompt=fallback_prompt,
+                            model_class=SingleArticle,
+                            model=config.models.heavy,
+                            system=(
+                                _WRITE_SYSTEM_WITH_CITATIONS
+                                if config.pipeline.inline_source_citations
+                                else _WRITE_SYSTEM
+                            ),
+                            num_ctx=config.effective_provider.heavy_ctx,
+                            num_predict=fallback_num_predict,
+                            stage="compile_article",
+                        )
+                        resolved_paths = fallback_resolved_paths
+                        confidence = _compute_confidence(resolved_paths, db)
+                        prompt_degraded = True
+                        log.warning(
+                            "Compiled '%s' with reduced prompt context; some source or existing "
+                            "article text was trimmed. Review the draft and align the loaded "
+                            "model context with heavy_ctx if this recurs.",
+                            name,
+                        )
+                        retry_succeeded = True
+                        break
+                    except (
+                        StructuredOutputError,
+                        LLMBadRequestError,
+                        LLMTruncatedError,
+                    ) as retry_error:
+                        e = retry_error
+                        if not _is_prompt_context_overflow(retry_error):
+                            break
+            if retry_succeeded:
+                pass
+            else:
+                failure_category = (
+                    "context_too_large" if isinstance(e, ValueError) else _categorize_failure(e)
+                )
+                log.error("Failed to write '%s': %s", name, e)
+                _record_failure(name, failure_category)
+                db.mark_concept_compile_state(
+                    name, resolved_paths or source_paths, "failed", error=str(e)
+                )
+                continue
 
         draft_path = _write_draft(
             content_result=result,
@@ -853,13 +1090,17 @@ def compile_concepts(
             canonical_title=name,
             concept_aliases=db.get_aliases(name),
             alias_map=alias_map,
+            prompt_degraded=prompt_degraded,
         )
         draft_paths.append(draft_path)
-        for sp in resolved_paths:
-            db.mark_raw_status(sp, "compiled")
+        db.mark_concept_compile_state(name, resolved_paths, "compiled")
         elapsed = time.monotonic() - _t_concept
         concept_timings[name] = elapsed
         log.info("Draft written: %s (%.1fs)", draft_path.name, elapsed)
+
+    if failure_categories:
+        summary = ", ".join(f"{len(v)} {k}" for k, v in sorted(failure_categories.items()))
+        log.warning("Compile failures by category: %s", summary)
 
     return draft_paths, failed, concept_timings
 
@@ -955,7 +1196,7 @@ def compile_notes(
             num_ctx=config.effective_provider.fast_ctx,
             stage="compile_plan",
         )
-    except (StructuredOutputError, LLMBadRequestError) as e:
+    except (StructuredOutputError, LLMBadRequestError, LLMTruncatedError) as e:
         log.error("Planning failed: %s", e)
         return [], ["__planning_failed__"]
 
@@ -978,6 +1219,7 @@ def compile_notes(
     # ── Step 2: Write each article ────────────────────────────────────────────
     draft_paths: list[Path] = []
     failed: list[str] = []
+    failure_categories: dict[str, list[str]] = {}
     source_rel_paths = [str(p.relative_to(config.vault)) for p in paths]
 
     for article in plan.articles:
@@ -994,6 +1236,14 @@ def compile_notes(
         write_prompt = _write_prompt_legacy(article, sources_text, existing_titles, language=lang)
 
         try:
+            num_predict = _article_num_predict(config, write_prompt, _WRITE_SYSTEM)
+        except ValueError as e:
+            log.error("Failed to write '%s': %s", article.title, e)
+            failed.append(article.title)
+            failure_categories.setdefault("context_too_large", []).append(article.title)
+            continue
+
+        try:
             result: SingleArticle = request_structured(
                 client=client,
                 prompt=write_prompt,
@@ -1001,12 +1251,13 @@ def compile_notes(
                 model=config.models.heavy,
                 system=_WRITE_SYSTEM,
                 num_ctx=config.effective_provider.heavy_ctx,
-                num_predict=min(_MAX_ARTICLE_PREDICT, config.effective_provider.heavy_ctx),
+                num_predict=num_predict,
                 stage="compile_article",
             )
-        except (StructuredOutputError, LLMBadRequestError) as e:
+        except (StructuredOutputError, LLMBadRequestError, LLMTruncatedError) as e:
             log.error("Failed to write '%s': %s", article.title, e)
             failed.append(article.title)
+            failure_categories.setdefault(_categorize_failure(e), []).append(article.title)
             continue
 
         # Preserve existing_meta if updating an existing article
@@ -1036,6 +1287,10 @@ def compile_notes(
         for p in paths:
             rel = str(p.relative_to(config.vault))
             db.mark_raw_status(rel, "compiled")
+
+    if failure_categories:
+        summary = ", ".join(f"{len(v)} {k}" for k, v in sorted(failure_categories.items()))
+        log.warning("Compile failures by category: %s", summary)
 
     return draft_paths, failed
 
@@ -1150,9 +1405,14 @@ def reject_draft(
     except ValueError:
         log.warning("Draft is outside vault: %s", draft_path)
         return
+    article_record = db.get_article(draft_rel)
     db.delete_article(draft_rel)
     if draft_path.exists():
         draft_path.unlink()
+
+    source_paths = article_record.sources if article_record is not None else []
+    if source_paths:
+        db.mark_concept_compile_state(title, source_paths, "pending")
 
     if feedback:
         db.add_rejection(title, feedback, body=draft_body)

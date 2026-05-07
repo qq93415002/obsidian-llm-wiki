@@ -12,6 +12,7 @@ from obsidian_llm_wiki.models import RawNoteRecord, WikiArticleRecord
 from obsidian_llm_wiki.ollama_client import OllamaClient
 from obsidian_llm_wiki.pipeline.compile import (
     _apply_draft_media_mode,
+    _article_num_predict,
     _build_olw_annotations,
     _build_source_refs,
     _gather_sources,
@@ -22,6 +23,7 @@ from obsidian_llm_wiki.pipeline.compile import (
     _repair_malformed_embeds,
     _repair_malformed_wikilinks,
     _rewrite_citation_markers,
+    _strip_empty_wikilinks,
     _strip_olw_annotations,
     _strip_self_wikilinks,
     _strip_unknown_wikilinks,
@@ -58,6 +60,33 @@ def make_mock_client(response: str = "{}") -> OllamaClient:
     return client
 
 
+def test_article_num_predict_respects_config_cap(config):
+    config.pipeline.article_max_tokens = 2048
+
+    assert _article_num_predict(config, prompt="short", system="system") == 2048
+
+
+def test_article_num_predict_raises_when_context_too_small(config):
+    """When prompt fills heavy_ctx, available output drops below the floor needed for
+    reliable structured generation. Raise so the caller can mark this concept as failed
+    rather than send max_tokens=0 (silent malformed behavior on some providers)."""
+    config.provider = config.effective_provider.model_copy(update={"heavy_ctx": 1024})
+    prompt = "x" * 3200  # ~800 prompt tokens; leaves <512 for output.
+
+    with pytest.raises(ValueError, match="too large"):
+        _article_num_predict(config, prompt=prompt, system="")
+
+
+def test_article_num_predict_floors_at_min_when_math_dominates(config):
+    """When math allows between the floor and user cap, return the math limit."""
+    config.provider = config.effective_provider.model_copy(update={"heavy_ctx": 4096})
+    config.pipeline.article_max_tokens = 16384
+    prompt = "x" * 1000  # ~250 prompt tokens, leaves ~3590 available
+    result = _article_num_predict(config, prompt=prompt, system="")
+    assert 512 <= result <= 4096
+    assert result < 16384  # capped by math, not config
+
+
 # ── Annotations ───────────────────────────────────────────────────────────────
 
 
@@ -88,6 +117,11 @@ def test_build_annotations_all_low_quality(db):
     db.upsert_raw(rec_b)
     annotations = _build_olw_annotations(0.6, ["raw/a.md", "raw/b.md"], db)
     assert any("low-quality" in a for a in annotations)
+
+
+def test_build_annotations_prompt_degraded(db):
+    annotations = _build_olw_annotations(0.75, ["raw/a.md", "raw/b.md"], db, prompt_degraded=True)
+    assert any("prompt degraded to fit provider context" in a for a in annotations)
 
 
 def test_strip_annotations_removes_olw_auto(db):
@@ -246,6 +280,12 @@ def test_strip_self_wikilinks_unwraps_self_links():
     body = _strip_self_wikilinks("[[Scrum]] and [[Scrum|this page]] link to [[Kanban]].", "Scrum")
 
     assert body == "Scrum and this page link to [[Kanban]]."
+
+
+def test_strip_empty_wikilinks_removes_empty_targets():
+    body = _strip_empty_wikilinks("Bad [[]]. Display [[|shown]]. Keep [[Kanban]].")
+
+    assert body == "Bad . Display shown. Keep [[Kanban]]."
 
 
 def test_repair_malformed_embeds_converts_bare_media_embed():
@@ -629,6 +669,9 @@ def test_compile_concepts_skips_pending_draft(config, db):
     assert failed == []
     assert client.generate.call_count == 0
     assert "User-reviewed draft body." in draft_path.read_text()
+    state = db.get_compile_state("Alpha", "raw/a.md")
+    assert state is not None
+    assert state["status"] == "deferred_draft"
 
 
 def test_compile_concepts_marks_sources_after_each_success(config, db):
@@ -655,6 +698,106 @@ def test_compile_concepts_marks_sources_after_each_success(config, db):
     assert failed == ["Beta"]
     assert db.get_raw("raw/a.md").status == "compiled"
     assert db.get_raw("raw/b.md").status == "ingested"
+
+
+def test_compile_concepts_mixed_source_failure_keeps_only_failed_concept_queued(config, db):
+    import json
+
+    db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
+    db.upsert_raw(RawNoteRecord(path="raw/b.md", content_hash="h2", status="ingested"))
+    db.upsert_concepts("raw/a.md", ["Alpha", "Beta"])
+    db.upsert_concepts("raw/b.md", ["Beta"])
+    (config.vault / "raw" / "a.md").write_text("---\ntitle: A\n---\nContent A.")
+    (config.vault / "raw" / "b.md").write_text("---\ntitle: B\n---\nContent B.")
+
+    client = make_mock_client()
+    client.generate.side_effect = [
+        json.dumps({"title": "Alpha", "content": "Alpha content.", "tags": []}),
+        "not valid json",
+        "not valid json",
+        "not valid json",
+    ]
+
+    drafts, failed, _ = compile_concepts(config, client, db, concepts=["Alpha", "Beta"])
+
+    assert len(drafts) == 1
+    assert failed == ["Beta"]
+    assert db.get_compile_state("Alpha", "raw/a.md")["status"] == "compiled"
+    assert db.get_compile_state("Beta", "raw/a.md")["status"] == "failed"
+    assert db.get_compile_state("Beta", "raw/b.md")["status"] == "failed"
+    assert db.get_raw("raw/a.md").status == "ingested"
+    assert db.get_raw("raw/b.md").status == "ingested"
+    assert db.concepts_needing_compile() == ["Beta"]
+
+
+def test_compile_concepts_force_clears_manual_edit_defer(config, db):
+    import json
+
+    db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
+    db.upsert_concepts("raw/a.md", ["Alpha"])
+    (config.vault / "raw" / "a.md").write_text("---\ntitle: A\n---\nContent.")
+    wiki_path = config.wiki_dir / "Alpha.md"
+    wiki_path.write_text("---\ntitle: Alpha\n---\nEdited.")
+    db.upsert_article(
+        WikiArticleRecord(
+            path=str(wiki_path.relative_to(config.vault)),
+            title="Alpha",
+            sources=["raw/a.md"],
+            content_hash="old-hash",
+            is_draft=False,
+        )
+    )
+
+    client = make_mock_client(json.dumps({"title": "Alpha", "content": "New.", "tags": []}))
+
+    drafts, failed, _ = compile_concepts(config, client, db)
+    assert drafts == []
+    assert failed == []
+    assert db.get_compile_state("Alpha", "raw/a.md")["status"] == "deferred_manual_edit"
+
+    drafts, failed, _ = compile_concepts(config, client, db, force=True, concepts=["Alpha"])
+    assert len(drafts) == 1
+    assert failed == []
+    assert db.get_compile_state("Alpha", "raw/a.md")["status"] == "compiled"
+
+
+def test_approve_and_reject_update_compile_state(config, db):
+    import frontmatter as fm_lib
+
+    from obsidian_llm_wiki.vault import atomic_write
+
+    db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
+    db.upsert_concepts("raw/a.md", ["Alpha"])
+    draft_path = config.drafts_dir / "Alpha.md"
+    meta = {"title": "Alpha", "status": "draft", "tags": [], "sources": ["raw/a.md"]}
+    atomic_write(draft_path, fm_lib.dumps(fm_lib.Post("Body.", **meta)))
+    db.upsert_article(
+        WikiArticleRecord(
+            path=str(draft_path.relative_to(config.vault)),
+            title="Alpha",
+            sources=["raw/a.md"],
+            content_hash="h",
+            is_draft=True,
+        )
+    )
+    db.mark_concept_compile_state("Alpha", ["raw/a.md"], "deferred_draft")
+
+    approve_drafts(config, db, [draft_path])
+    assert db.get_compile_state("Alpha", "raw/a.md")["status"] == "compiled"
+
+    draft_path = config.drafts_dir / "Alpha.md"
+    atomic_write(draft_path, fm_lib.dumps(fm_lib.Post("Body.", **meta)))
+    db.upsert_article(
+        WikiArticleRecord(
+            path=str(draft_path.relative_to(config.vault)),
+            title="Alpha",
+            sources=["raw/a.md"],
+            content_hash="h2",
+            is_draft=True,
+        )
+    )
+    reject_draft(draft_path, config, db, feedback="Nope")
+    assert db.get_compile_state("Alpha", "raw/a.md")["status"] == "pending"
 
 
 # ── Approval records approved_at ─────────────────────────────────────────────
@@ -809,3 +952,117 @@ def test_compile_concepts_article_llm_bad_request_adds_to_failed(config, db):
     drafts, failed, _ = compile_concepts(config, client, db)
     assert "Heavy Concept" in failed
     assert drafts == []
+
+
+def test_compile_concepts_retries_with_smaller_source_budget_on_context_overflow(
+    config, db, caplog
+):
+    """Provider prompt-overflow errors should retry once with less source text."""
+    from obsidian_llm_wiki.openai_compat_client import LLMBadRequestError
+
+    db.upsert_raw(RawNoteRecord(path="raw/src.md", content_hash="h1", status="ingested"))
+    db.upsert_concepts("raw/src.md", ["Heavy Concept"])
+    (config.vault / "raw" / "src.md").write_text(
+        "---\ntitle: Source\n---\n" + ("Content about Heavy Concept. " * 500),
+        encoding="utf-8",
+    )
+
+    mock_response = (
+        '{"title":"Heavy Concept","tags":["heavy-concept"],'
+        '"content":"Body","sources":["raw/src.md"]}'
+    )
+    client = make_mock_client(mock_response)
+    overflow_error = LLMBadRequestError(
+        "HTTP 400: The number of tokens to keep from the initial prompt "
+        "is greater than the context length"
+    )
+    client.generate.side_effect = [
+        overflow_error,
+        mock_response,
+    ]
+
+    drafts, failed, _ = compile_concepts(config, client, db)
+
+    assert failed == []
+    assert len(drafts) == 1
+    assert client.generate.call_count >= 2
+    draft_text = drafts[0].read_text(encoding="utf-8")
+    assert "prompt degraded to fit provider context" in draft_text
+    assert "Compiled 'Heavy Concept' with reduced prompt context" in caplog.text
+
+
+def test_compile_concepts_retry_value_error_is_counted_as_context_too_large(
+    config, db, caplog, monkeypatch
+):
+    """Retry budget failures should preserve the context_too_large category."""
+    from obsidian_llm_wiki.openai_compat_client import LLMBadRequestError
+    from obsidian_llm_wiki.pipeline import compile as compile_module
+
+    db.upsert_raw(RawNoteRecord(path="raw/src.md", content_hash="h1", status="ingested"))
+    db.upsert_concepts("raw/src.md", ["Heavy Concept"])
+    (config.vault / "raw" / "src.md").write_text(
+        "---\ntitle: Source\n---\n" + ("Content about Heavy Concept. " * 500),
+        encoding="utf-8",
+    )
+
+    overflow_error = LLMBadRequestError(
+        "HTTP 400: The number of tokens to keep from the initial prompt "
+        "is greater than the context length"
+    )
+    client = make_mock_client()
+    client.generate.side_effect = [overflow_error]
+
+    num_predict_calls = iter(
+        [
+            1024,
+            ValueError(
+                "Source content too large for heavy_ctx=8192: prompt ~9000 tokens leaves only 0"
+            ),
+            ValueError(
+                "Source content too large for heavy_ctx=8192: prompt ~9000 tokens leaves only 0"
+            ),
+            ValueError(
+                "Source content too large for heavy_ctx=8192: prompt ~9000 tokens leaves only 0"
+            ),
+            ValueError(
+                "Source content too large for heavy_ctx=8192: prompt ~9000 tokens leaves only 0"
+            ),
+        ]
+    )
+
+    def fake_article_num_predict(_config, _prompt, _system):
+        result = next(num_predict_calls)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(compile_module, "_article_num_predict", fake_article_num_predict)
+
+    drafts, failed, _ = compile_concepts(config, client, db)
+
+    assert drafts == []
+    assert failed == ["Heavy Concept"]
+    assert "Compile failures by category: 1 context_too_large" in caplog.text
+    assert "Compile failures by category: 1 other" not in caplog.text
+
+
+def test_compile_concepts_normal_success_has_no_prompt_degraded_annotation(config, db):
+    db.upsert_raw(RawNoteRecord(path="raw/src.md", content_hash="h1", status="ingested"))
+    db.upsert_concepts("raw/src.md", ["Normal Concept"])
+    (config.vault / "raw" / "src.md").write_text(
+        "---\ntitle: Source\n---\nContent about Normal Concept.",
+        encoding="utf-8",
+    )
+
+    mock_response = (
+        '{"title":"Normal Concept","tags":["normal-concept"],'
+        '"content":"Body","sources":["raw/src.md"]}'
+    )
+    client = make_mock_client(mock_response)
+
+    drafts, failed, _ = compile_concepts(config, client, db)
+
+    assert failed == []
+    assert len(drafts) == 1
+    draft_text = drafts[0].read_text(encoding="utf-8")
+    assert "prompt degraded to fit provider context" not in draft_text

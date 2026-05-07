@@ -10,7 +10,11 @@ from obsidian_llm_wiki.models import (
     RawNoteRecord,
     WikiArticleRecord,
 )
-from obsidian_llm_wiki.state import _CURRENT_SCHEMA_VERSION, StateDB
+from obsidian_llm_wiki.state import (
+    _CURRENT_SCHEMA_VERSION,
+    DuplicateSynthesisQuestionHashError,
+    StateDB,
+)
 
 
 @pytest.fixture
@@ -177,6 +181,7 @@ def test_concepts_needing_compile(db):
     db.upsert_raw(RawNoteRecord(path="raw/b.md", content_hash="h2", status="compiled"))
     db.upsert_concepts("raw/a.md", ["New Concept"])
     db.upsert_concepts("raw/b.md", ["Old Concept"])
+    db.mark_concept_compile_state("Old Concept", ["raw/b.md"], "compiled")
     needing = db.concepts_needing_compile()
     assert "New Concept" in needing
     assert "Old Concept" not in needing  # source already compiled
@@ -185,6 +190,7 @@ def test_concepts_needing_compile(db):
 def test_concepts_needing_compile_empty_when_all_compiled(db):
     db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="compiled"))
     db.upsert_concepts("raw/a.md", ["Done Concept"])
+    db.mark_concept_compile_state("Done Concept", ["raw/a.md"], "compiled")
     assert db.concepts_needing_compile() == []
 
 
@@ -335,6 +341,7 @@ def test_stub_superseded_by_real_source(db):
     db.add_stub("Shared Concept")
     db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="compiled"))
     db.upsert_concepts("raw/a.md", ["Shared Concept"])
+    db.mark_concept_compile_state("Shared Concept", ["raw/a.md"], "compiled")
     # Stub should not appear since real source already compiled
     needing = db.concepts_needing_compile()
     assert "Shared Concept" not in needing
@@ -409,6 +416,77 @@ def test_approve_article_sets_timestamp(db):
     assert art is not None
     assert art.approved_at is not None
     assert art.approval_notes == "Looks great"
+
+
+def test_synthesis_article_round_trips_extended_fields(db):
+    article = WikiArticleRecord(
+        path="wiki/synthesis/topic.md",
+        title="Topic",
+        sources=[],
+        content_hash="hash",
+        is_draft=False,
+        kind="synthesis",
+        question_hash="abc123def4567890",
+        synthesis_sources=["wiki/Alpha.md", "wiki/Beta.md"],
+        synthesis_source_hashes=[["wiki/Alpha.md", "ha"], ["wiki/Beta.md", "hb"]],
+    )
+
+    db.upsert_article(article)
+
+    got = db.get_article("wiki/synthesis/topic.md")
+    assert got is not None
+    assert got.kind == "synthesis"
+    assert got.question_hash == "abc123def4567890"
+    assert got.synthesis_sources == ["wiki/Alpha.md", "wiki/Beta.md"]
+    assert got.synthesis_source_hashes == [["wiki/Alpha.md", "ha"], ["wiki/Beta.md", "hb"]]
+
+
+def test_find_synthesis_by_question_hash(db):
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/synthesis/topic.md",
+            title="Topic",
+            sources=[],
+            content_hash="hash",
+            is_draft=False,
+            kind="synthesis",
+            question_hash="dup-hash",
+        )
+    )
+
+    found = db.find_synthesis_by_question_hash("dup-hash")
+    assert found is not None
+    assert found.path == "wiki/synthesis/topic.md"
+
+
+def test_insert_synthesis_atomic_rejects_duplicate_question_hash(db):
+    first = WikiArticleRecord(
+        path="wiki/synthesis/topic.md",
+        title="Topic",
+        sources=[],
+        content_hash="hash1",
+        is_draft=False,
+        kind="synthesis",
+        question_hash="same-hash",
+    )
+    second = WikiArticleRecord(
+        path="wiki/synthesis/topic-2.md",
+        title="Topic 2",
+        sources=[],
+        content_hash="hash2",
+        is_draft=False,
+        kind="synthesis",
+        question_hash="same-hash",
+    )
+
+    with db._tx():
+        db.insert_synthesis_atomic(first)
+    with db._tx(), pytest.raises(DuplicateSynthesisQuestionHashError):
+        db.insert_synthesis_atomic(second)
+
+    articles = [a for a in db.list_articles() if a.kind == "synthesis"]
+    assert len(articles) == 1
+    assert articles[0].path == "wiki/synthesis/topic.md"
 
 
 # ── v0.2: schema versioning ───────────────────────────────────────────────────
@@ -503,3 +581,56 @@ def test_upsert_note_language_none(db):
 
 def test_get_note_language_missing_path(db):
     assert db.get_note_language("raw/nonexistent.md") is None
+
+
+def test_replace_concepts_for_source_removes_stale_rows(db):
+    db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
+    db.upsert_concepts("raw/a.md", ["Alpha", "Beta"])
+    db.mark_concept_compile_state("Alpha", ["raw/a.md"], "compiled")
+
+    db.replace_concepts_for_source("raw/a.md", ["Beta", "Gamma"])
+
+    assert set(db.get_concepts_for_sources(["raw/a.md"])) == {"Beta", "Gamma"}
+    assert db.get_compile_state("Alpha", "raw/a.md") is None
+    gamma_state = db.get_compile_state("Gamma", "raw/a.md")
+    assert gamma_state is not None
+    assert gamma_state["status"] == "pending"
+
+
+def test_mark_concept_compile_state_refreshes_raw_status(db):
+    db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
+    db.upsert_concepts("raw/a.md", ["Alpha", "Beta"])
+
+    db.mark_concept_compile_state("Alpha", ["raw/a.md"], "compiled")
+    assert db.get_raw("raw/a.md").status == "ingested"
+
+    db.mark_concept_compile_state("Beta", ["raw/a.md"], "compiled")
+    assert db.get_raw("raw/a.md").status == "compiled"
+
+
+def test_list_failed_concepts_returns_distinct_names(db):
+    db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
+    db.upsert_raw(RawNoteRecord(path="raw/b.md", content_hash="h2", status="ingested"))
+    db.upsert_concepts("raw/a.md", ["Alpha"])
+    db.upsert_concepts("raw/b.md", ["Alpha", "Beta"])
+    db.mark_concept_compile_state("Alpha", ["raw/a.md", "raw/b.md"], "failed", error="bad json")
+    db.mark_concept_compile_state("Beta", ["raw/b.md"], "failed", error="timeout")
+
+    assert db.list_failed_concepts() == ["Alpha", "Beta"]
+
+
+def test_ingest_chunk_crud(db):
+    db.upsert_ingest_chunk(
+        "raw/a.md",
+        "hash",
+        0,
+        3,
+        100,
+        '{"summary":"s","concepts":[],"suggested_topics":[],"named_references":[],"quality":"high","language":null}',
+    )
+    rows = db.list_ingest_chunks("raw/a.md", "hash", 3, 100)
+    assert len(rows) == 1
+    assert rows[0]["chunk_index"] == 0
+
+    db.delete_ingest_chunks("raw/a.md", "hash", 3, 100)
+    assert db.list_ingest_chunks("raw/a.md", "hash", 3, 100) == []
