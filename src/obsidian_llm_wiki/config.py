@@ -76,7 +76,7 @@ def default_wiki_toml(
         f"ingest_parallel = false   # true = parallel chunks\n"
         f"article_max_tokens = 16384 # soft cap on generated tokens per article; "
         f"auto-reduced to fit context\n"
-        f"concept_draft_soft_cap = 1800 # concept-driven compile only; set to "
+        f"concept_draft_soft_cap = 2400 # concept-driven compile only; set to "
         f'"article_max_tokens" to disable extra capping (no effect on --legacy)\n'
         f"{citation_line}"
         f'# source_citation_style = "legend-only"  # legend-only | inline-wikilink\n'
@@ -118,7 +118,7 @@ class PipelineConfig(BaseModel):
     auto_maintain: bool = False
     ingest_parallel: bool = False  # parallel chunk analysis (needs OLLAMA_NUM_PARALLEL≥4)
     article_max_tokens: int = 16384
-    concept_draft_soft_cap: int | str = 1800
+    concept_draft_soft_cap: int | str = 2400
     inline_source_citations: bool = False
     source_citation_style: str = "legend-only"
     draft_media: str = "reference"

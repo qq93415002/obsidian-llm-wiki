@@ -91,7 +91,7 @@ def test_article_num_predict_concept_compile_applies_soft_output_cap(config, db,
 
     assert failed == []
     assert len(drafts) == 1
-    assert captured["num_predict"] == 1800
+    assert captured["num_predict"] == 2400
 
 
 def test_article_num_predict_concept_compile_can_disable_extra_soft_cap(config, db, monkeypatch):
@@ -632,6 +632,45 @@ def test_compile_concepts_preserves_canonical_title(config, db):
     assert len(drafts) == 1
     assert drafts[0].name == "Product Backlog.md"
     assert db.get_article("wiki/.drafts/Product Backlog.md").title == "Product Backlog"
+
+
+def test_compile_concepts_preserves_existing_tags_when_model_returns_none(config, db):
+    import hashlib
+    import json
+
+    db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
+    db.upsert_concepts("raw/a.md", ["Astrology"])
+    (config.vault / "raw" / "a.md").write_text("---\ntitle: A\n---\nContent.")
+    existing_body = "Existing."
+    existing_note = (
+        "---\n"
+        "title: Astrology\n"
+        "tags: [astrology, zodiac]\n"
+        "created: '2026-04-25'\n"
+        "---\n\n"
+        f"{existing_body}"
+    )
+    (config.wiki_dir / "Astrology.md").write_text(existing_note)
+    db.upsert_article(
+        WikiArticleRecord(
+            path="wiki/Astrology.md",
+            title="Astrology",
+            sources=["raw/a.md"],
+            content_hash=hashlib.sha256(existing_body.encode("utf-8")).hexdigest(),
+            is_draft=False,
+        )
+    )
+
+    client = make_mock_client(
+        json.dumps({"title": "Astrology", "content": "Updated content.", "tags": []})
+    )
+
+    drafts, failed, _ = compile_concepts(config, client, db, concepts=["Astrology"])
+
+    assert failed == []
+    assert len(drafts) == 1
+    draft_text = drafts[0].read_text(encoding="utf-8")
+    assert "tags:\n- astrology\n- zodiac" in draft_text
 
 
 def test_compile_concepts_legend_only_citations_do_not_link_inline(config, db):
