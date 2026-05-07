@@ -10,7 +10,7 @@ import pytest
 
 from obsidian_llm_wiki.compare.runner import run_compare
 from obsidian_llm_wiki.config import Config
-from obsidian_llm_wiki.pipeline.orchestrator import PipelineReport
+from obsidian_llm_wiki.pipeline.orchestrator import FailureReason, FailureRecord, PipelineReport
 
 
 def _make_vault(tmp_path: Path) -> Path:
@@ -219,3 +219,62 @@ def test_run_compare_rejects_negative_sample_n(tmp_path, patched_pipeline):
 
     with pytest.raises(ValueError, match="sample_n must be at least 1"):
         run_compare(current, challenger, vault / ".olw" / "compare", sample_n=-1)
+
+
+def test_run_compare_serializes_failure_error_messages(tmp_path, monkeypatch):
+    vault = _make_vault(tmp_path)
+
+    fake_client = MagicMock()
+    fake_client.close = MagicMock()
+    monkeypatch.setattr("obsidian_llm_wiki.client_factory.build_client", lambda cfg: fake_client)
+
+    fake_db = MagicMock()
+    fake_db.close = MagicMock()
+    monkeypatch.setattr("obsidian_llm_wiki.state.StateDB", lambda _path: fake_db)
+
+    def fake_run(self, auto_approve=True, max_rounds=2):
+        return PipelineReport(
+            ingested=1,
+            compiled=0,
+            failed=[
+                FailureRecord(
+                    concept="Alpha",
+                    reason=FailureReason.TRUNCATED,
+                    error_msg="ollama: model returned no usable content",
+                )
+            ],
+            published=0,
+            lint_issues=0,
+            stubs_created=0,
+            rounds=1,
+            timings={"ingest": 1.0},
+            concept_timings={},
+        )
+
+    monkeypatch.setattr(
+        "obsidian_llm_wiki.pipeline.orchestrator.PipelineOrchestrator.run", fake_run
+    )
+
+    from obsidian_llm_wiki.pipeline.query import QueryRunResult
+
+    monkeypatch.setattr(
+        "obsidian_llm_wiki.pipeline.query.run_query",
+        lambda **_kw: QueryRunResult(answer="Answer.", selected_pages=["page1"]),
+    )
+
+    from obsidian_llm_wiki.models import LintResult
+
+    monkeypatch.setattr(
+        "obsidian_llm_wiki.pipeline.lint.run_lint",
+        lambda config, db, fix=False: LintResult(issues=[], health_score=95.0, summary="clean"),
+    )
+
+    current = Config.from_vault(vault)
+    challenger = Config.from_vault(vault, models={"heavy": "new-heavy"})
+    report = run_compare(current, challenger, vault / ".olw" / "compare")
+    root = vault / ".olw" / "compare" / report.run_id
+    raw_report = json.loads((root / "results" / "raw_report.json").read_text())
+
+    assert raw_report["current"]["pipeline_report"]["failed"][0]["error_msg"] == (
+        "ollama: model returned no usable content"
+    )

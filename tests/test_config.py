@@ -35,9 +35,38 @@ def test_pipeline_config_article_max_tokens_default():
     assert cfg.article_max_tokens == 16384
 
 
+def test_pipeline_config_concept_draft_soft_cap_default():
+    cfg = PipelineConfig()
+    assert cfg.concept_draft_soft_cap == 1800
+
+
 def test_pipeline_config_article_max_tokens_from_dict():
     cfg = PipelineConfig(**{"article_max_tokens": 2048})
     assert cfg.article_max_tokens == 2048
+
+
+def test_pipeline_config_concept_draft_soft_cap_accepts_article_max_tokens_mode():
+    cfg = PipelineConfig(**{"concept_draft_soft_cap": "article_max_tokens"})
+    assert cfg.concept_draft_soft_cap == "article_max_tokens"
+
+
+def test_pipeline_config_concept_draft_soft_cap_validator_rejects_small_int():
+    import pytest
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="concept_draft_soft_cap must be >= 512"):
+        PipelineConfig(concept_draft_soft_cap=256)
+
+
+def test_pipeline_config_concept_draft_soft_cap_validator_rejects_unknown_string():
+    import pytest
+    from pydantic import ValidationError
+
+    with pytest.raises(
+        ValidationError,
+        match='concept_draft_soft_cap must be an integer >= 512 or "article_max_tokens"',
+    ):
+        PipelineConfig(concept_draft_soft_cap="none")
 
 
 def test_pipeline_config_article_max_tokens_validator_rejects_below_floor():
@@ -85,6 +114,7 @@ def test_default_wiki_toml_contains_inline_source_citations_comment():
 def test_default_wiki_toml_contains_graph_quality_defaults():
     toml = default_wiki_toml()
     assert "article_max_tokens = 16384" in toml
+    assert "concept_draft_soft_cap = 1800" in toml
     assert "source_citation_style" in toml
     assert "draft_media" in toml
     assert "graph_quality_checks = true" in toml

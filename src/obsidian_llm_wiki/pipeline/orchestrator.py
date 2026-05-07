@@ -11,6 +11,7 @@ Used by `olw run` and `olw watch`. Handles:
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -251,39 +252,66 @@ def _run_compile(
 
     # Classify individual concept failures from the persisted compile_state error.
     # compile_concepts already records per-concept failure details in the DB.
-    failure_records = [
-        FailureRecord(
-            concept=name,
-            reason=_classify_compile_failure(db, name),
-        )
-        for name in failed_names
-    ]
+    failure_records: list[FailureRecord] = []
+    for name in failed_names:
+        reason, error_msg = _classify_compile_failure(db, name)
+        failure_records.append(FailureRecord(concept=name, reason=reason, error_msg=error_msg))
     return draft_paths, failure_records, concept_timings
 
 
-def _classify_compile_failure(db: StateDB, concept_name: str) -> FailureReason:
+def _classify_compile_failure(db: StateDB, concept_name: str) -> tuple[FailureReason, str]:
     source_paths = db.get_sources_for_concept(concept_name)
     for source_path in source_paths:
         row = db.get_compile_state(concept_name, source_path)
         if row is None or row["status"] != "failed" or not row["error"]:
             continue
 
-        # compile_concepts persists only error text today, so preserve useful user-facing
-        # categories by decoding the stored message instead of collapsing everything to unknown.
-        message = str(row["error"]).lower()
-        if "output truncated" in message or "no usable content" in message:
-            return FailureReason.TRUNCATED
-        if "no readable sources" in message:
-            return FailureReason.MISSING_SOURCES
-        if (
-            "structured output" in message
-            or "json" in message
-            or "context too large" in message
-            or "heavy_ctx" in message
-            or "context length" in message
-            or "n_keep" in message
-            or "http 400" in message
-        ):
-            return FailureReason.LLM_OUTPUT
+        reason, message = _parse_compile_failure_payload(str(row["error"]))
+        if reason is not None:
+            return reason, message
 
-    return FailureReason.UNKNOWN
+        # Legacy fallback for older rows that persisted only plain-text messages.
+        lower = message.lower()
+        if "output truncated" in lower or "no usable content" in lower:
+            return FailureReason.TRUNCATED, message
+        if "no readable sources" in lower:
+            return FailureReason.MISSING_SOURCES, message
+        if (
+            "structured output" in lower
+            or "json schema" in lower
+            or "parse json" in lower
+            or "bad json" in lower
+            or "context too large" in lower
+            or "heavy_ctx" in lower
+            or "context length" in lower
+            or "n_keep" in lower
+            or "http 400" in lower
+        ):
+            return FailureReason.LLM_OUTPUT, message
+
+        return FailureReason.UNKNOWN, message
+
+    return FailureReason.UNKNOWN, ""
+
+
+def _parse_compile_failure_payload(payload: str) -> tuple[FailureReason | None, str]:
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return None, payload
+
+    if not isinstance(data, dict):
+        return None, payload
+    message = str(data.get("message") or payload)
+    reason = data.get("reason")
+    mapping = {
+        "truncated": FailureReason.TRUNCATED,
+        "no_sources": FailureReason.MISSING_SOURCES,
+        "structured_output": FailureReason.LLM_OUTPUT,
+        "bad_request": FailureReason.LLM_OUTPUT,
+        "context_too_large": FailureReason.LLM_OUTPUT,
+        "other": FailureReason.UNKNOWN,
+    }
+    if isinstance(reason, str) and reason in mapping:
+        return mapping[reason], message
+    return None, message

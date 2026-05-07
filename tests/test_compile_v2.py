@@ -61,9 +61,9 @@ def make_mock_client(response: str = "{}") -> OllamaClient:
 
 
 def test_article_num_predict_respects_config_cap(config):
-    config.pipeline.article_max_tokens = 1024
+    config.pipeline.article_max_tokens = 2048
 
-    assert _article_num_predict(config, prompt="short", system="system") == 1024
+    assert _article_num_predict(config, prompt="short", system="system") == 2048
 
 
 def test_article_num_predict_concept_compile_applies_soft_output_cap(config, db, monkeypatch):
@@ -92,6 +92,35 @@ def test_article_num_predict_concept_compile_applies_soft_output_cap(config, db,
     assert failed == []
     assert len(drafts) == 1
     assert captured["num_predict"] == 1800
+
+
+def test_article_num_predict_concept_compile_can_disable_extra_soft_cap(config, db, monkeypatch):
+    config.provider = config.effective_provider.model_copy(update={"heavy_ctx": 262144})
+    config.pipeline.article_max_tokens = 5000
+    config.pipeline.concept_draft_soft_cap = "article_max_tokens"
+    db.upsert_raw(RawNoteRecord(path="raw/src.md", content_hash="h1", status="ingested"))
+    db.upsert_concepts("raw/src.md", ["Heavy Concept"])
+    (config.vault / "raw" / "src.md").write_text(
+        "---\ntitle: Source\n---\nContent about Heavy Concept.",
+        encoding="utf-8",
+    )
+
+    captured: dict[str, int] = {}
+
+    def fake_request_structured(**kwargs):
+        captured["num_predict"] = kwargs["num_predict"]
+        return SingleArticle(title="Heavy Concept", content="Body", tags=["heavy-concept"])
+
+    monkeypatch.setattr(
+        "obsidian_llm_wiki.pipeline.compile.request_structured",
+        fake_request_structured,
+    )
+
+    drafts, failed, _ = compile_concepts(config, make_mock_client(), db, concepts=["Heavy Concept"])
+
+    assert failed == []
+    assert len(drafts) == 1
+    assert captured["num_predict"] == 5000
 
 
 def test_article_num_predict_raises_when_context_too_small(config):

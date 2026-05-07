@@ -1850,6 +1850,8 @@ def run(
         console.print(f"\n[yellow]{len(report.failed)} concept(s) failed:[/yellow]")
         for f in report.failed:
             console.print(f"  [dim]{f.concept}[/dim] ({f.reason.value})")
+            if f.error_msg:
+                console.print(f"    [dim]{f.error_msg}[/dim]")
 
 
 # ── review ────────────────────────────────────────────────────────────────────

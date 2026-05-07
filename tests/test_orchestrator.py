@@ -159,6 +159,73 @@ def test_run_compile_uses_persisted_truncated_reason(config, db):
     assert len(failures) == 1
     assert failures[0].reason == FailureReason.TRUNCATED
     assert failures[0].concept == "Fails"
+    assert "output truncated at max_tokens=251824" in failures[0].error_msg
+
+
+def test_run_compile_uses_persisted_no_usable_content_reason(config, db):
+    import obsidian_llm_wiki.pipeline.compile as compile_mod
+
+    db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
+    db.upsert_concepts("raw/a.md", ["Fails"])
+
+    original = compile_mod.compile_concepts
+
+    def fake_compile(**kwargs):
+        db.mark_concept_compile_state(
+            "Fails",
+            ["raw/a.md"],
+            "failed",
+            error=(
+                "ollama: model returned no usable content (finish_reason=stop). Likely causes: "
+                "model context exhausted, provider/model incompatibility, or an excessively "
+                "large requested output budget."
+            ),
+        )
+        return ([], ["Fails"], {})
+
+    compile_mod.compile_concepts = fake_compile
+    try:
+        drafts, failures, _ = _run_compile(
+            config, make_mock_client(), db, concepts=["Fails"], dry_run=False
+        )
+    finally:
+        compile_mod.compile_concepts = original
+
+    assert drafts == []
+    assert len(failures) == 1
+    assert failures[0].reason == FailureReason.TRUNCATED
+    assert "no usable content" in failures[0].error_msg
+
+
+def test_run_compile_reads_structured_failure_payload(config, db):
+    import obsidian_llm_wiki.pipeline.compile as compile_mod
+
+    db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
+    db.upsert_concepts("raw/a.md", ["Fails"])
+
+    original = compile_mod.compile_concepts
+
+    def fake_compile(**kwargs):
+        db.mark_concept_compile_state(
+            "Fails",
+            ["raw/a.md"],
+            "failed",
+            error=('{"version": 1, "reason": "no_sources", "message": "No readable sources"}'),
+        )
+        return ([], ["Fails"], {})
+
+    compile_mod.compile_concepts = fake_compile
+    try:
+        drafts, failures, _ = _run_compile(
+            config, make_mock_client(), db, concepts=["Fails"], dry_run=False
+        )
+    finally:
+        compile_mod.compile_concepts = original
+
+    assert drafts == []
+    assert len(failures) == 1
+    assert failures[0].reason == FailureReason.MISSING_SOURCES
+    assert failures[0].error_msg == "No readable sources"
 
 
 def test_run_compile_bad_request_not_transient(config, db):

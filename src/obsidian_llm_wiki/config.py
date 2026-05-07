@@ -76,6 +76,8 @@ def default_wiki_toml(
         f"ingest_parallel = false   # true = parallel chunks\n"
         f"article_max_tokens = 16384 # soft cap on generated tokens per article; "
         f"auto-reduced to fit context\n"
+        f"concept_draft_soft_cap = 1800 # concept-driven compile only; set to "
+        f'"article_max_tokens" to disable extra capping (no effect on --legacy)\n'
         f"{citation_line}"
         f'# source_citation_style = "legend-only"  # legend-only | inline-wikilink\n'
         f'# draft_media = "reference"  # reference | embed | omit\n'
@@ -116,6 +118,7 @@ class PipelineConfig(BaseModel):
     auto_maintain: bool = False
     ingest_parallel: bool = False  # parallel chunk analysis (needs OLLAMA_NUM_PARALLEL≥4)
     article_max_tokens: int = 16384
+    concept_draft_soft_cap: int | str = 1800
     inline_source_citations: bool = False
     source_citation_style: str = "legend-only"
     draft_media: str = "reference"
@@ -129,6 +132,21 @@ class PipelineConfig(BaseModel):
             raise ValueError(
                 f"article_max_tokens must be >= 512 (got {value}); "
                 "values below this disable structured generation reliability."
+            )
+        return value
+
+    @field_validator("concept_draft_soft_cap")
+    @classmethod
+    def validate_concept_draft_soft_cap(cls, value: int | str) -> int | str:
+        if isinstance(value, str):
+            if value != "article_max_tokens":
+                raise ValueError(
+                    'concept_draft_soft_cap must be an integer >= 512 or "article_max_tokens"'
+                )
+            return value
+        if value < 512:
+            raise ValueError(
+                f"concept_draft_soft_cap must be >= 512 (got {value}) when set numerically"
             )
         return value
 

@@ -46,6 +46,8 @@ def test_status_shows_live_pipeline_lock(tmp_path):
     _init_status_vault(tmp_path)
     StateDB(tmp_path / ".olw" / "state.db")
 
+    # CliRunner invokes the command in-process, so this assertion depends on POSIX flock
+    # treating a second open() on the same path as a contending live lock.
     with pipeline_lock(tmp_path) as acquired:
         assert acquired is True
         result = CliRunner().invoke(cli, ["status", "--vault", str(tmp_path)])
