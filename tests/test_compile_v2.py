@@ -119,6 +119,11 @@ def test_build_annotations_all_low_quality(db):
     assert any("low-quality" in a for a in annotations)
 
 
+def test_build_annotations_prompt_degraded(db):
+    annotations = _build_olw_annotations(0.75, ["raw/a.md", "raw/b.md"], db, prompt_degraded=True)
+    assert any("prompt degraded to fit provider context" in a for a in annotations)
+
+
 def test_strip_annotations_removes_olw_auto(db):
     body = "<!-- olw-auto: low-confidence -->\n\n## Overview\n\nContent."
     stripped = _strip_olw_annotations(body)
@@ -947,3 +952,117 @@ def test_compile_concepts_article_llm_bad_request_adds_to_failed(config, db):
     drafts, failed, _ = compile_concepts(config, client, db)
     assert "Heavy Concept" in failed
     assert drafts == []
+
+
+def test_compile_concepts_retries_with_smaller_source_budget_on_context_overflow(
+    config, db, caplog
+):
+    """Provider prompt-overflow errors should retry once with less source text."""
+    from obsidian_llm_wiki.openai_compat_client import LLMBadRequestError
+
+    db.upsert_raw(RawNoteRecord(path="raw/src.md", content_hash="h1", status="ingested"))
+    db.upsert_concepts("raw/src.md", ["Heavy Concept"])
+    (config.vault / "raw" / "src.md").write_text(
+        "---\ntitle: Source\n---\n" + ("Content about Heavy Concept. " * 500),
+        encoding="utf-8",
+    )
+
+    mock_response = (
+        '{"title":"Heavy Concept","tags":["heavy-concept"],'
+        '"content":"Body","sources":["raw/src.md"]}'
+    )
+    client = make_mock_client(mock_response)
+    overflow_error = LLMBadRequestError(
+        "HTTP 400: The number of tokens to keep from the initial prompt "
+        "is greater than the context length"
+    )
+    client.generate.side_effect = [
+        overflow_error,
+        mock_response,
+    ]
+
+    drafts, failed, _ = compile_concepts(config, client, db)
+
+    assert failed == []
+    assert len(drafts) == 1
+    assert client.generate.call_count >= 2
+    draft_text = drafts[0].read_text(encoding="utf-8")
+    assert "prompt degraded to fit provider context" in draft_text
+    assert "Compiled 'Heavy Concept' with reduced prompt context" in caplog.text
+
+
+def test_compile_concepts_retry_value_error_is_counted_as_context_too_large(
+    config, db, caplog, monkeypatch
+):
+    """Retry budget failures should preserve the context_too_large category."""
+    from obsidian_llm_wiki.openai_compat_client import LLMBadRequestError
+    from obsidian_llm_wiki.pipeline import compile as compile_module
+
+    db.upsert_raw(RawNoteRecord(path="raw/src.md", content_hash="h1", status="ingested"))
+    db.upsert_concepts("raw/src.md", ["Heavy Concept"])
+    (config.vault / "raw" / "src.md").write_text(
+        "---\ntitle: Source\n---\n" + ("Content about Heavy Concept. " * 500),
+        encoding="utf-8",
+    )
+
+    overflow_error = LLMBadRequestError(
+        "HTTP 400: The number of tokens to keep from the initial prompt "
+        "is greater than the context length"
+    )
+    client = make_mock_client()
+    client.generate.side_effect = [overflow_error]
+
+    num_predict_calls = iter(
+        [
+            1024,
+            ValueError(
+                "Source content too large for heavy_ctx=8192: prompt ~9000 tokens leaves only 0"
+            ),
+            ValueError(
+                "Source content too large for heavy_ctx=8192: prompt ~9000 tokens leaves only 0"
+            ),
+            ValueError(
+                "Source content too large for heavy_ctx=8192: prompt ~9000 tokens leaves only 0"
+            ),
+            ValueError(
+                "Source content too large for heavy_ctx=8192: prompt ~9000 tokens leaves only 0"
+            ),
+        ]
+    )
+
+    def fake_article_num_predict(_config, _prompt, _system):
+        result = next(num_predict_calls)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(compile_module, "_article_num_predict", fake_article_num_predict)
+
+    drafts, failed, _ = compile_concepts(config, client, db)
+
+    assert drafts == []
+    assert failed == ["Heavy Concept"]
+    assert "Compile failures by category: 1 context_too_large" in caplog.text
+    assert "Compile failures by category: 1 other" not in caplog.text
+
+
+def test_compile_concepts_normal_success_has_no_prompt_degraded_annotation(config, db):
+    db.upsert_raw(RawNoteRecord(path="raw/src.md", content_hash="h1", status="ingested"))
+    db.upsert_concepts("raw/src.md", ["Normal Concept"])
+    (config.vault / "raw" / "src.md").write_text(
+        "---\ntitle: Source\n---\nContent about Normal Concept.",
+        encoding="utf-8",
+    )
+
+    mock_response = (
+        '{"title":"Normal Concept","tags":["normal-concept"],'
+        '"content":"Body","sources":["raw/src.md"]}'
+    )
+    client = make_mock_client(mock_response)
+
+    drafts, failed, _ = compile_concepts(config, client, db)
+
+    assert failed == []
+    assert len(drafts) == 1
+    draft_text = drafts[0].read_text(encoding="utf-8")
+    assert "prompt degraded to fit provider context" not in draft_text
