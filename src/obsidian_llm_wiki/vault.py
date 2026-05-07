@@ -270,9 +270,14 @@ def build_wiki_frontmatter(
     aliases: list[str] | None = None,
 ) -> dict[str, Any]:
     now = datetime.now().strftime("%Y-%m-%d")
+    sanitized_tags = sanitize_tags(tags)
+    if not sanitized_tags and existing_meta and isinstance(existing_meta.get("tags"), list):
+        sanitized_tags = sanitize_tags(
+            [str(tag) for tag in existing_meta["tags"] if tag is not None]
+        )
     meta: dict[str, Any] = {
         "title": title,
-        "tags": sanitize_tags(tags),
+        "tags": sanitized_tags,
         "sources": sources,
         "confidence": round(confidence, 2),
         "status": "draft" if is_draft else "published",

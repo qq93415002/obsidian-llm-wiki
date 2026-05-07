@@ -619,6 +619,24 @@ def test_list_failed_concepts_returns_distinct_names(db):
     assert db.list_failed_concepts() == ["Alpha", "Beta"]
 
 
+def test_mark_concept_compile_state_preserves_structured_error_payload(db):
+    import json
+
+    db.upsert_raw(RawNoteRecord(path="raw/a.md", content_hash="h1", status="ingested"))
+    db.upsert_concepts("raw/a.md", ["Alpha"])
+    payload = json.dumps({"version": 1, "reason": "truncated", "message": "Too long"})
+
+    db.mark_concept_compile_state("Alpha", ["raw/a.md"], "failed", error=payload)
+
+    row = db.get_compile_state("Alpha", "raw/a.md")
+    assert row is not None
+    assert json.loads(row["error"]) == {
+        "version": 1,
+        "reason": "truncated",
+        "message": "Too long",
+    }
+
+
 def test_ingest_chunk_crud(db):
     db.upsert_ingest_chunk(
         "raw/a.md",
