@@ -268,6 +268,8 @@ def _classify_compile_failure(db: StateDB, concept_name: str) -> FailureReason:
         if row is None or row["status"] != "failed" or not row["error"]:
             continue
 
+        # compile_concepts persists only error text today, so preserve useful user-facing
+        # categories by decoding the stored message instead of collapsing everything to unknown.
         message = str(row["error"]).lower()
         if "output truncated" in message or "no usable content" in message:
             return FailureReason.TRUNCATED

@@ -77,6 +77,7 @@ Three-stage local LLM pipeline turning Obsidian raw notes into a synthesized wik
 - **Config loading order:** `--vault` flag → `OLW_VAULT` env var → global config default vault → error
 - **Git safety:** All auto-operations use `[olw]`-prefixed commits; undo uses `git revert` (never destructive)
 - **Error handling:** LLM failures log + mark note as "failed" + continue (no crash). Config loading returns None on failure (fail open)
+- **Code comments:** Add comments only when the reason or invariant is non-obvious from the code itself. Prefer tests and commit messages for routine explanation; use comments for safeguards, provider quirks, heuristics, and tradeoffs that future agents or humans could otherwise misread.
 - **Testing:** All 200 tests mock OllamaClient via MagicMock, use tmp_path vaults and in-memory SQLite. Fixtures in `tests/fixtures/`. Integration tests marked with `@pytest.mark.integration`
 - **Python 3.11+:** Uses `tomllib` (stdlib), `from __future__ import annotations`, full type hints
 - **Ruff config:** rules E, F, I, UP; line-length 100

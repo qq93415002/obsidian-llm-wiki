@@ -941,6 +941,9 @@ def compile_concepts(
             continue
 
         try:
+            # Concept drafts stay on a fixed soft output budget even when heavy_ctx or
+            # article_max_tokens is huge; without this, OpenAI-compatible backends can be
+            # asked for absurd outputs and fail in misleading ways.
             num_predict = min(
                 _BUDGET_OUTPUT,
                 _article_num_predict(
