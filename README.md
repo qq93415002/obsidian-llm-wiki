@@ -1,8 +1,17 @@
 # obsidian-llm-wiki
 
+<p align="center">
+     <a href="https://pepy.tech/projects/obsidian-llm-wiki"><img src="https://static.pepy.tech/personalized-badge/obsidian-llm-wiki?period=total&units=NONE&left_color=BLACK&right_color=GREEN&left_text=downloads" alt="PyPI Downloads"></a>
+     <a href="https://github.com/kytmanov/obsidian-llm-wiki-local/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/kytmanov/obsidian-llm-wiki-local?style=flat"></a> 
+     <a href="https://github.com/kytmanov/obsidian-llm-wiki-local/network/members"><img alt="GitHub forks" src="https://img.shields.io/github/forks/kytmanov/obsidian-llm-wiki-local?style=flat"></a> 
+     <a href="https://github.com/kytmanov/obsidian-llm-wiki-local/commits/master"><img alt="GitHub last commit" src="https://img.shields.io/github/last-commit/kytmanov/obsidian-llm-wiki-local?style=flat"></a> 
+     <a href="https://github.com/kytmanov/obsidian-llm-wiki-local/actions/workflows/ci.yml"><img alt="CI status" src="https://img.shields.io/github/actions/workflow/status/kytmanov/obsidian-llm-wiki-local/ci.yml?style=flat&amp;label=CI"></a> 
+     <a href="https://pypi.org/project/obsidian-llm-wiki/"><img alt="PyPI version" src="https://img.shields.io/pypi/v/obsidian-llm-wiki?style=flat"></a>
+</p>
+
 **Turn your raw notes into a self-improving, interlinked wiki — powered by a local LLM.**
 
-Drop a markdown file into a folder. The pipeline reads it, extracts concepts, and creates or updates wiki articles with the new knowledge. Reject a draft and explain why — the next compile addresses your feedback. Over time your wiki compounds: every note you add (and every draft you review) makes the whole smarter.
+Drop a markdown file into a folder. The pipeline reads it, extracts concepts, and creates or updates wiki articles. If a draft is wrong, reject it and explain why; the next compile addresses your feedback. Over time, every note you add and every draft you review makes the wiki smarter.
 
 **Local-first, provider-flexible.** Runs 100% locally with [Ollama](https://ollama.com) by default. Also works with any OpenAI-compatible endpoint — Groq, Together AI, LM Studio, vLLM, Azure OpenAI, and [more](#providers).
 <p align="center">
@@ -34,26 +43,23 @@ The wiki lives in Obsidian, so you get the graph view, backlinks, and Dataview q
 
 ## Features
 
-- **Concept-driven, incremental compilation** — each concept gets its own article, updated only when its source notes change
-- **Rejection feedback loop** — reject a draft with a reason; the next compile injects your feedback into the prompt so the model addresses it
-- **Draft annotations** — low-confidence or single-source drafts are flagged with `<!-- olw-auto: ... -->` comments (invisible in Obsidian, stripped on approval)
-- **Rich review interface** — `olw review` lists drafts ranked by rejection count, shows diffs vs published and vs the last rejected version
-- **Pipeline orchestrator** — `olw run` runs ingest → compile → lint → [approve] as one command with timing and failure classification
-- **Selective recompile** — after a file save, only concepts linked to that source are recompiled (not the entire wiki)
-- **Self-maintenance** — `olw maintain --fix` repairs broken wikilinks via the alias map, creates stub articles for genuinely missing targets, and normalizes `[[Alias]]` links across published pages to `[[Canonical|Alias]]`
-- **Manual edit protection** — edited an article by hand? The compiler detects the change and skips it
-- **Source traceability** — every article links back to the raw notes it was built from; optional inline citations can attach claim-level `[S1](#Sources)` markers
-- **File watcher** — `olw watch` auto-processes anything dropped into `raw/`
-- **Wiki health checks** — `olw lint` detects orphans, broken links, stale articles (no LLM needed)
-- **Query your wiki** — `olw query "what is X?"` answers from your published articles
-- **Safe switch advisor** — `olw compare` previews your current vault against one challenger model/provider config in isolated vaults and recommends whether to switch
-- **Git safety net** — every auto-action is committed; `olw undo` reverts safely
-- **Concept aliases** — aliases (e.g. `PC` for "Program Counter") are extracted at ingest, written to each article's frontmatter, and used to resolve queries and repair broken wikilinks (`olw maintain --fix` rewrites `[[PC]]` to `[[Program Counter|PC]]`)
-- **Knowledge item audit** — explicitly evidenced named references and prominent quoted titles are preserved as candidates without forcing them into concept articles
-- **Multi-language** — automatically detects the language of each note at ingest time; articles are written in the detected language; override globally with `language = "en"` in `wiki.toml`
-- **Language-agnostic evidence rules** — concept normalization and item preservation avoid topic-specific deny lists and language-specific word lists; named references are accepted only when explicitly evidenced in the note
-- **Multi-provider** — swap Ollama for Groq, Together AI, LM Studio, vLLM, Azure OpenAI, or any OpenAI-compatible endpoint via `olw setup`
-- **Offline test suite** — 600+ tests run without Ollama or any provider
+**Incremental compiles.** Each concept gets its own article. When you change a source note, only the articles tied to that note recompile, not the whole vault.
+
+**File watcher.** Run `olw watch` once and it processes anything you drop into `raw/` automatically. Ingest and compile run in the background, so the wiki keeps improving while you keep writing notes.
+
+**Rejection feedback.** Reject a draft and attach a reason. The next compile of that concept includes your feedback in the prompt, so the model can address it. Five rejections without an approval auto-blocks the concept until you re-enable it.
+
+**Hand-edits are preserved.** Edit an article in Obsidian and the compiler will detect the change on the next run and skip it. Your edits aren't overwritten by regeneration.
+
+**Query and synthesize.** `olw query "what is X?"` answers from your published wiki without embeddings or a vector DB. With `--synthesize` it saves the answer as a permanent wiki page, complete with source hashes and the same hand-edit protection.
+
+**Self-maintenance.** Aliases like `PC` for `Program Counter` are extracted at ingest and used to repair broken wikilinks. `olw lint` reports orphans and stale articles; `olw maintain --fix` rewrites alias links and creates stubs for missing targets.
+
+**Provider-flexible.** Ollama by default, fully offline. You can also point it at Groq, Together AI, LM Studio, vLLM, Azure OpenAI, or any OpenAI-compatible endpoint via `olw setup`. `olw compare` previews a switch in isolated vaults so you can decide before editing `wiki.toml`.
+
+**Multi-language.** Each note's language is auto-detected at ingest and the article is written in that language. Extraction rules don't depend on hard-coded word lists, so any language works.
+
+**Git-aware.** Every automatic action commits with an `[olw]` prefix, and `olw undo` reverts the last one. Raw notes are never modified; `olw` only writes to `wiki/` and `.olw/`.
 
 ---
 
@@ -218,6 +224,40 @@ olw compare --heavy-model qwen2.5:14b
 olw watch
 # Drop a file in raw/ → ingest + compile happen automatically (selective: only linked concepts)
 ```
+
+---
+
+## Query synthesis
+
+`olw query` answers from the published wiki without embeddings. Use `--save` to keep a dated Q&A note in `wiki/queries/`, or `--synthesize` to publish a reusable synthesis page in `wiki/synthesis/`.
+
+```bash
+# Just answer in the terminal
+olw query "What is backpropagation?"
+
+# Save a dated Q&A note under wiki/queries/
+olw query "What is backpropagation?" --save
+
+# Save a reusable synthesis article under wiki/synthesis/
+olw query "What is backpropagation?" --synthesize
+```
+
+Synthesis behavior:
+
+- synthesis pages are published notes tagged with `synthesis`
+- they store the source question, selected source pages, and source page body hashes in frontmatter
+- `wiki/index.md` includes a capped `## Synthesis` section sourced from the DB, ordered by newest first and then title
+- compare runs stay side-effect-free: query evaluation never writes to the active vault during `olw compare`
+- query-time synthesis does not create a new `[olw]` git commit
+
+Duplicate handling:
+
+- default behavior is `keep_existing` for the same normalized question
+- interactive terminals only prompt for a strategy when a duplicate already exists
+- `save_with_suffix` keeps the existing page and writes a new suffixed file
+- `update_in_place` rewrites the existing synthesis only when its body still matches the DB-tracked hash
+- if the existing synthesis was manually edited, `update_in_place` refuses to overwrite it
+- synthesis pages cannot cite another synthesis page as a source
 
 ---
 
@@ -414,6 +454,7 @@ my-wiki/
 │   │   ├── Quantum Computing Fundamentals.md
 │   │   └── ML Fundamentals.md
 │   ├── queries/                ← saved Q&A answers (olw query --save)
+│   ├── synthesis/              ← saved synthesis articles (olw query --synthesize)
 │   ├── .drafts/                ← pending human review
 │   ├── index.md                ← auto-generated navigation + routing layer
 │   └── log.md                  ← append-only operation history
@@ -435,7 +476,7 @@ my-wiki/
 
 ```toml
 [models]
-fast = "gemma4:e4b"        # extraction, analysis, query routing
+fast  = "gemma4:e4b"      # extraction, analysis, query routing
 heavy = "qwen2.5:14b"     # article generation, Q&A answers
 # Single-model: set heavy = fast
 
@@ -543,6 +584,7 @@ After editing `wiki.toml`, no reinstall is needed. Run `olw compile --force` to 
 | `olw status --failed` | List failed notes with error messages |
 | `olw query "question"` | Answer from your wiki |
 | `olw query "..." --save` | Answer and save to `wiki/queries/` |
+| `olw query "..." --synthesize` | Answer and save a synthesis article to `wiki/synthesis/` |
 | `olw lint` | Health check: orphans, broken links, stale articles |
 | `olw lint --fix` | Auto-fix missing frontmatter fields |
 | `olw watch` | File watcher — auto-pipeline on new notes |
@@ -748,6 +790,17 @@ For existing vaults with a `[ollama]` section you can also add a `[provider]` bl
 Chatbots forget. Every conversation starts fresh. This tool builds a **persistent artifact** — a wiki that grows with every note you add, that you can open in Obsidian, search, query, and edit by hand.
 
 The LLM is a compiler, not a conversation partner. You give it raw material; it produces structured knowledge. The output is plain markdown files you own forever.
+
+---
+
+## Feedback
+
+`olw` does not collect telemetry.
+
+If something was confusing, useful, annoying, or missing, please tell us:
+- Bug reports: https://github.com/kytmanov/obsidian-llm-wiki-local/issues
+- Suggestions and experience reports: https://github.com/kytmanov/obsidian-llm-wiki-local/discussions
+- Source code: https://github.com/kytmanov/obsidian-llm-wiki-local
 
 ---
 

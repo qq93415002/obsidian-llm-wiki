@@ -1,5 +1,116 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.8.1] - 2026-05-07
+
+### Added
+
+- Added internal foundation types and reader/engine interfaces for future
+  source-aware and pack-oriented features. These are additive and are not
+  wired into runtime behavior yet.
+
+### Fixed
+
+- **Saved query/link hygiene** — query and synthesis outputs now strip invented
+  `[[wikilinks]]` that do not resolve to existing pages, preventing broken links
+  from being written into `wiki/queries/` and `wiki/synthesis/`.
+- **Compile overflow diagnostics** — prompt-context retry failures now preserve
+  the `context_too_large` failure category instead of degrading to `other` when
+  reduced retry budgets still cannot fit within the configured context window.
+- **LM Studio smoke/runtime robustness** — smoke model resolution and compile
+  fallback handling were hardened so prompt/context overflow scenarios are more
+  recoverable and easier to diagnose.
+
+### Changed
+
+- **Schema migration v7 -> v8** (additive). `raw_notes` gains six new
+  columns: `source_type` (default `'notes'`), `origin_uri`, `imported_at`,
+  `normalized_hash`, `extractor_version`, `prompt_version`. Existing rows
+  get the default for `source_type` and `NULL` elsewhere. No code path
+  reads the new columns yet. v0.8 behavior is unchanged.
+
+### Migration notes
+
+- On first run with this version, `state.db` upgrades from v7 to v8
+  automatically. Recommended: back up `.olw/state.db` first
+  (`cp .olw/state.db .olw/state.db.bak.v7`). The upgrade is one-way:
+  downgrading the package after upgrading the DB leaves a `version=8`
+  row. Older code paths still function but are not regression-tested
+  against future schemas.
+
+## [0.8.0] - 2026-05-02
+
+### Highlights
+
+**v0.8.0 adds query synthesis as a first-class workflow.** You can now save grounded answers as durable synthesis articles in `wiki/synthesis/`, deduplicate them by normalized question hash, and keep compare runs isolated from active query and synthesis content.
+
+### New Features
+
+- **`olw query --synthesize`** — answer a question from the wiki and save the result as a published synthesis article in `wiki/synthesis/`.
+- **Question-hash deduplication** — repeated synthesis requests for the same normalized question reuse the existing article instead of creating duplicates.
+- **Saved query outputs** — query answers can be persisted in `wiki/queries/` alongside synthesis articles for later review.
+
+### Changes
+
+- **Safer synthesis bookkeeping** — synthesis articles are tracked in state with `kind`, `question_hash`, and source hashes so duplicate detection and update-in-place behavior stay deterministic.
+- **Query/link hygiene** — query resolution now understands `sources/...` links and lint flags synthesis-to-synthesis source chains as advisory issues instead of silently allowing them.
+- **Compare safety coverage** — compare runs explicitly avoid mutating active `wiki/queries/` and `wiki/synthesis/`, with smoke coverage for those guarantees.
+- **Docs refresh** — README and smoke guidance now cover query synthesis, LM Studio flows, and the latest support links.
+
+## [0.7.2] - 2026-05-01
+
+### Highlights
+
+**Fixes silent compile failures on local LLM providers (#48).** Articles whose generated output exceeded `article_max_tokens` previously surfaced as confusing JSON-parse errors with empty model responses on llama.cpp/LM Studio. Truncation is now detected at the HTTP layer and surfaced as `LLMTruncatedError` with an actionable message naming the exact config knob to raise.
+
+### Bug Fixes
+
+- **Legacy compile path respects `article_max_tokens` (#48)** — `compile_notes` (the `--legacy` path) was hardcoded to 4096 tokens and ignored `pipeline.article_max_tokens`. It now uses the same `_article_num_predict` budget as the primary `compile_concepts` path.
+- **Truncation detection in HTTP clients** — both `OpenAICompatClient` and `OllamaClient` now inspect `finish_reason`/`done_reason` and raise `LLMTruncatedError` instead of returning empty content, eliminating the silent JSON-parse failure mode.
+- **Cloud max_tokens auto-downgrade** — providers that reject `max_tokens` as exceeding the model's hard output limit (e.g. legacy gpt-4-turbo with 4096-output models) now trigger a single halve-and-retry instead of bubbling an HTTP 400 to the user.
+- **Pre-flight context-budget guard** — `_article_num_predict` raises `ValueError` (caught per-concept) when source content fills `heavy_ctx` past the floor needed for reliable JSON generation, instead of silently sending `num_predict=0`.
+
+### Changes
+
+- **`pipeline.article_max_tokens` default raised to 16384** (was 4096). Restores the original `heavy_ctx // 2` design that was lowered defensively to dodge an LM Studio HTTP 400 already covered by an existing auto-downgrade.
+- **`PipelineConfig.article_max_tokens` validator** rejects values below 512 (the floor required for structured generation).
+- **`olw lint`** surfaces a `config_outdated` issue when `article_max_tokens == 4096`, guiding existing users whose `wiki.toml` still pins the legacy default.
+- **Compile failure summary** logs a per-category count (`truncated`, `bad_request`, `structured_output`, `context_too_large`) at the end of each compile run, distinguishing truncation issues from JSON-schema or no-source failures.
+- **`n_keep > n_ctx` auto-downgrade** now logs at WARNING (was DEBUG), surfacing the silent context-mismatch fallback to the user.
+
+### Migration
+
+If your `wiki.toml` was generated by an earlier `olw setup` it likely contains `article_max_tokens = 4096`. Either delete the line to pick up the new default or raise it explicitly:
+
+```toml
+[pipeline]
+article_max_tokens = 16384
+```
+
+`olw lint` will flag this until corrected.
+
+## [0.7.1] - 2026-04-28
+
+### Highlights
+
+**v0.7.1 hardens long-note recovery and concept compile retries.** Interrupted chunked ingest can now resume from saved progress, and failed concept articles remain retryable instead of disappearing behind source-level completion state.
+
+### Bug Fixes
+
+- **Resumable chunked ingest (#44)** — long notes persist successful chunk analyses as checkpoints and reruns skip completed chunks instead of starting over after an intermittent LLM failure.
+- **Failed concept compile recovery (#42)** — compile scheduling now tracks status per concept/source pair, so partial success no longer marks an entire raw note done while some concepts are still failed.
+- **Changed compiled notes re-ingest correctly** — `olw ingest` now skips previously ingested/compiled notes only when the stored content hash still matches the file on disk.
+- **Checkpoint cleanup for shortened notes** — stale chunk checkpoints are purged when a note no longer needs chunking.
+- **Safer compile token budget** — article generation now clamps `num_predict` to the true remaining context budget instead of forcing a minimum that can exceed provider limits.
+- **Published article link hygiene** — generated output cleanup removes malformed empty wikilinks before publication.
+
+### Changes
+
+- **Targeted concept compile** — `olw compile --concept NAME` can compile a specific concept even when it is not currently pending.
+- **Failed concept retry CLI** — `olw compile --retry-failed` now retries failed concept compiles in addition to failed raw-note ingest records.
+- **Article output budget config** — `pipeline.article_max_tokens` can tune the soft article-generation output cap while still respecting provider context limits.
+
 ## [0.7.0] - 2026-04-26
 
 ### Highlights

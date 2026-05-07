@@ -113,6 +113,30 @@ def test_dry_run_writes_nothing(vault, config, db, fixtures_dir):
     assert list(config.drafts_dir.glob("*.md")) == []
 
 
+def test_legacy_compile_uses_article_max_tokens_from_config(vault, config, db, fixtures_dir):
+    """Regression for issue #48: compile_notes (legacy --legacy path) was hardcoded
+    to 4096 and ignored config.pipeline.article_max_tokens. After the fix, num_predict
+    must reflect the user's configured cap."""
+    config.pipeline.article_max_tokens = 12000
+    config.provider = config.effective_provider.model_copy(update={"heavy_ctx": 32768})
+
+    raw_note = vault / "raw" / "note.md"
+    raw_note.write_text("# Note\n\nShort content.")
+    db.upsert_raw(RawNoteRecord(path="raw/note.md", content_hash="h", status="ingested"))
+
+    plan_json = (fixtures_dir / "compile_plan_valid.json").read_text()
+    article_json = (fixtures_dir / "single_article_valid.json").read_text()
+    client = _make_client(plan_json, article_json)
+
+    compile_notes(config=config, client=client, db=db)
+
+    # Find the article-write call (second generate call) and inspect num_predict
+    write_calls = [c for c in client.generate.call_args_list if c.kwargs.get("num_predict")]
+    assert write_calls, "expected at least one generate call with num_predict"
+    article_call = write_calls[-1]
+    assert article_call.kwargs["num_predict"] == 12000
+
+
 def test_approve_moves_draft_to_wiki(vault, config, db):
     from obsidian_llm_wiki.models import WikiArticleRecord
     from obsidian_llm_wiki.vault import write_note
@@ -199,6 +223,7 @@ def test_compile_concepts_skips_when_no_concepts_needing_compile(vault, config, 
         )
     )
     db.upsert_concepts("raw/note.md", ["Some Concept"])
+    db.mark_concept_compile_state("Some Concept", ["raw/note.md"], "compiled")
 
     client = MagicMock()
     drafts, failed, _ = compile_concepts(config=config, client=client, db=db)
@@ -333,6 +358,30 @@ def test_compile_concepts_marks_sources_compiled(vault, config, db, fixtures_dir
 
     record = db.get_raw("raw/note.md")
     assert record.status == "compiled"
+
+
+def test_compile_concepts_failed_same_source_stays_queued(vault, config, db):
+    import json
+
+    db.upsert_raw(RawNoteRecord(path="raw/note.md", content_hash="abc", status="ingested"))
+    db.upsert_concepts("raw/note.md", ["Alpha", "Beta"])
+    (vault / "raw" / "note.md").write_text("Body.")
+
+    client = MagicMock()
+    client.generate.side_effect = [
+        json.dumps({"title": "Alpha", "content": "Alpha content.", "tags": []}),
+        "not valid json",
+        "not valid json",
+        "not valid json",
+    ]
+
+    drafts, failed, _ = compile_concepts(config=config, client=client, db=db)
+
+    assert len(drafts) == 1
+    assert failed == ["Beta"]
+    assert db.get_raw("raw/note.md").status == "ingested"
+    assert "Beta" in db.concepts_needing_compile()
+    assert "Alpha" not in db.concepts_needing_compile()
 
 
 # ── Language tests ─────────────────────────────────────────────────────────────
