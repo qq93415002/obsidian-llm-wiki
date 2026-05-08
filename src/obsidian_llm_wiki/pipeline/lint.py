@@ -337,17 +337,19 @@ def _add_graph_quality_issues(
             )
         )
 
-    concept_targets = {
-        title.lower() for title, path in title_index.items() if ".drafts" in path.parts
-    }
     disconnected: list[Path] = []
-    if len(concept_targets) >= 2 and config.drafts_dir.exists():
+    draft_data: list[tuple[Path, str, str]] = []
+    if config.drafts_dir.exists():
         for draft in sorted(config.drafts_dir.rglob("*.md")):
             try:
                 meta, body = parse_note(draft)
             except Exception:
                 continue
-            own_title = str(meta.get("title", draft.stem)).lower()
+            draft_data.append((draft, str(meta.get("title", draft.stem)).lower(), body))
+
+    concept_targets = {title for _, title, _ in draft_data}
+    if len(concept_targets) >= 2:
+        for draft, own_title, body in draft_data:
             concept_links = {
                 link.lower()
                 for link in extract_wikilinks(body)

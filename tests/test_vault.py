@@ -337,6 +337,17 @@ def test_build_wiki_frontmatter_deduplicates_tags():
     assert meta["tags"] == ["ai", "machine-learning"]
 
 
+def test_build_wiki_frontmatter_preserves_existing_tags_when_new_tags_are_empty():
+    meta = build_wiki_frontmatter(
+        title="Test",
+        tags=[],
+        sources=[],
+        confidence=0.5,
+        existing_meta={"tags": ["astrology", "zodiac"]},
+    )
+    assert meta["tags"] == ["astrology", "zodiac"]
+
+
 def test_chunk_text_heading_split():
     text = (
         "# Title\n\nIntro paragraph.\n\n## Section 1\n\n"

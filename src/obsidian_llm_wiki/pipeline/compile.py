@@ -15,6 +15,7 @@ Articles are written to wiki/.drafts/ for human review before publishing.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import time
@@ -104,12 +105,6 @@ def _resolve_language(sources: list[str], db: StateDB, config: Config) -> str | 
     return langs.pop() if len(langs) == 1 else None
 
 
-# Token budget constants
-_BUDGET_SYSTEM = 600  # system + schema
-_BUDGET_TOPIC_LIST = 400  # existing article titles
-_BUDGET_OUTPUT = 1800  # room for generated content
-_BUDGET_SAFETY = 200  # buffer
-
 _QUALITY_BONUS = {"high": 0.25, "medium": 0.1, "low": 0.0}
 
 # Stubs are short by design (≤150 words). Hardcoded cap is intentional.
@@ -118,6 +113,8 @@ _MAX_STUB_PREDICT = 512
 # Math floor: structured generation needs enough headroom for title + content + tags.
 # Below this, JSON schema can't reliably complete.
 _MIN_ARTICLE_PREDICT = 512
+
+_STRUCTURED_ERROR_VERSION = 1
 
 
 def _content_hash(text: str) -> str:
@@ -135,6 +132,28 @@ def _categorize_failure(exc: Exception) -> str:
     return "other"
 
 
+def _structured_compile_error(reason: str, message: str) -> str:
+    return json.dumps(
+        {"version": _STRUCTURED_ERROR_VERSION, "reason": reason, "message": message},
+        ensure_ascii=True,
+    )
+
+
+def _concept_draft_num_predict(config: Config, prompt: str, system: str) -> int:
+    computed = _article_num_predict(config, prompt, system)
+    soft_cap = config.pipeline.concept_draft_soft_cap
+    if soft_cap == "article_max_tokens":
+        return computed
+    capped = min(soft_cap, computed)
+    if computed > capped:
+        log.info(
+            "Capping concept draft output budget %d -> %d (pipeline.concept_draft_soft_cap)",
+            computed,
+            capped,
+        )
+    return capped
+
+
 def _article_num_predict(config: Config, prompt: str, system: str) -> int:
     """Return num_predict capped by both user config and remaining context budget.
 
@@ -150,6 +169,7 @@ def _article_num_predict(config: Config, prompt: str, system: str) -> int:
             f"prompt ~{estimated_prompt_tokens} tokens leaves only {available_output} "
             f"for output (need >= {_MIN_ARTICLE_PREDICT}). Reduce sources or raise heavy_ctx."
         )
+
     return max(_MIN_ARTICLE_PREDICT, min(config.pipeline.article_max_tokens, available_output))
 
 
@@ -884,8 +904,14 @@ def compile_concepts(
                 )
             except (StructuredOutputError, LLMBadRequestError, LLMTruncatedError) as e:
                 log.error("Failed to write stub '%s': %s", name, e)
-                _record_failure(name, _categorize_failure(e))
-                db.mark_concept_compile_state(name, source_paths, "failed", error=str(e))
+                reason = _categorize_failure(e)
+                _record_failure(name, reason)
+                db.mark_concept_compile_state(
+                    name,
+                    source_paths,
+                    "failed",
+                    error=_structured_compile_error(reason, str(e)),
+                )
                 continue
             draft_path = _write_draft(
                 content_result=result,
@@ -936,11 +962,18 @@ def compile_concepts(
         if not resolved_paths:
             log.warning("No readable sources for concept '%s', skipping", name)
             _record_failure(name, "no_sources")
-            db.mark_concept_compile_state(name, source_paths, "failed", error="No readable sources")
+            db.mark_concept_compile_state(
+                name,
+                source_paths,
+                "failed",
+                error=_structured_compile_error("no_sources", "No readable sources"),
+            )
             continue
 
         try:
-            num_predict = _article_num_predict(
+            # Concept drafts stay on a configurable soft output budget so users can
+            # keep the default safety rail or explicitly opt back into article_max_tokens.
+            num_predict = _concept_draft_num_predict(
                 config,
                 write_prompt,
                 (
@@ -953,7 +986,10 @@ def compile_concepts(
             log.error("Failed to write '%s': %s", name, e)
             _record_failure(name, "context_too_large")
             db.mark_concept_compile_state(
-                name, resolved_paths or source_paths, "failed", error=str(e)
+                name,
+                resolved_paths or source_paths,
+                "failed",
+                error=_structured_compile_error("context_too_large", str(e)),
             )
             continue
 
@@ -1020,7 +1056,7 @@ def compile_concepts(
                         inline_source_citations=config.pipeline.inline_source_citations,
                     )
                     try:
-                        fallback_num_predict = _article_num_predict(
+                        fallback_num_predict = _concept_draft_num_predict(
                             config,
                             fallback_prompt,
                             (
@@ -1075,7 +1111,10 @@ def compile_concepts(
                 log.error("Failed to write '%s': %s", name, e)
                 _record_failure(name, failure_category)
                 db.mark_concept_compile_state(
-                    name, resolved_paths or source_paths, "failed", error=str(e)
+                    name,
+                    resolved_paths or source_paths,
+                    "failed",
+                    error=_structured_compile_error(failure_category, str(e)),
                 )
                 continue
 
@@ -1236,6 +1275,9 @@ def compile_notes(
         write_prompt = _write_prompt_legacy(article, sources_text, existing_titles, language=lang)
 
         try:
+            # Legacy compile intentionally follows only article_max_tokens plus remaining
+            # context budget. concept_draft_soft_cap applies to the default concept-driven
+            # path and does not change --legacy behavior.
             num_predict = _article_num_predict(config, write_prompt, _WRITE_SYSTEM)
         except ValueError as e:
             log.error("Failed to write '%s': %s", article.title, e)

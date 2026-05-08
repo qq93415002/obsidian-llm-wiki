@@ -137,6 +137,28 @@ def test_legacy_compile_uses_article_max_tokens_from_config(vault, config, db, f
     assert article_call.kwargs["num_predict"] == 12000
 
 
+def test_legacy_compile_ignores_concept_draft_soft_cap(vault, config, db, fixtures_dir):
+    """concept_draft_soft_cap applies only to concept-driven compile, not --legacy."""
+    config.pipeline.article_max_tokens = 5000
+    config.pipeline.concept_draft_soft_cap = 1200
+    config.provider = config.effective_provider.model_copy(update={"heavy_ctx": 32768})
+
+    raw_note = vault / "raw" / "note.md"
+    raw_note.write_text("# Note\n\nShort content.")
+    db.upsert_raw(RawNoteRecord(path="raw/note.md", content_hash="h", status="ingested"))
+
+    plan_json = (fixtures_dir / "compile_plan_valid.json").read_text()
+    article_json = (fixtures_dir / "single_article_valid.json").read_text()
+    client = _make_client(plan_json, article_json)
+
+    compile_notes(config=config, client=client, db=db)
+
+    write_calls = [c for c in client.generate.call_args_list if c.kwargs.get("num_predict")]
+    assert write_calls, "expected at least one generate call with num_predict"
+    article_call = write_calls[-1]
+    assert article_call.kwargs["num_predict"] == 5000
+
+
 def test_approve_moves_draft_to_wiki(vault, config, db):
     from obsidian_llm_wiki.models import WikiArticleRecord
     from obsidian_llm_wiki.vault import write_note
